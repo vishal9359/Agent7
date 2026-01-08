@@ -58,6 +58,24 @@ class CFG:
     function: str
     nodes: List[CFGNode] = field(default_factory=list)
     edges: List[CFGEdge] = field(default_factory=list)
+    
+    def _fix_orphaned_nodes(self, entry_id: int):
+        """Connect orphaned nodes to entry or return"""
+        # Get all node IDs
+        node_ids = {node.id for node in self.nodes}
+        
+        # Get nodes with incoming edges
+        nodes_with_incoming = {edge.to_node for edge in self.edges}
+        
+        # Find orphaned nodes (except entry)
+        orphaned = node_ids - nodes_with_incoming - {entry_id}
+        
+        # Connect orphaned nodes to entry
+        for orphan_id in orphaned:
+            # Check if this orphan already has an edge from entry
+            has_entry_edge = any(e.from_node == entry_id and e.to_node == orphan_id for e in self.edges)
+            if not has_entry_edge:
+                self.edges.append(CFGEdge(from_node=entry_id, to_node=orphan_id))
 
 
 @dataclass
@@ -144,38 +162,319 @@ class CFGBuilder:
     """Builds CFG JSON from C++ source code"""
     
     @staticmethod
+    def _read_cpp_file(filepath: str) -> str:
+        """Read C++ file content, handling encoding issues"""
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            print(f"  Warning: Could not read {filepath}: {e}")
+            return ""
+    
+    @staticmethod
+    def _preprocess_code(code: str) -> str:
+        """Remove comments and normalize whitespace"""
+        # Remove single-line comments
+        code = re.sub(r'//.*?$', '', code, flags=re.MULTILINE)
+        
+        # Remove multi-line comments
+        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+        
+        # Normalize whitespace
+        code = re.sub(r'\s+', ' ', code)
+        
+        return code
+    
+    @staticmethod
+    def _find_functions(code: str) -> List[Dict]:
+        """Extract function definitions from C++ code"""
+        functions = []
+        
+        # More flexible pattern to match function definitions
+        # Handles: return_type function_name(params) { ... }
+        # Also handles: Class::method, namespace::function, etc.
+        # Pattern breakdown:
+        # 1. Return type (can include spaces, ::, <templates>, *, &)
+        # 2. Function name (identifier or Class::method)
+        # 3. Parameters
+        # 4. Opening brace
+        
+        # Match function signatures more flexibly
+        # This pattern handles: void func(), int Class::method(), etc.
+        pattern = r'(?:[\w:]+\s+)+(\w+(?:::\w+)?)\s*\([^)]*\)\s*\{'
+        
+        for match in re.finditer(pattern, code):
+            func_name = match.group(1).strip()
+            
+            # Skip if it looks like a constructor/destructor
+            if func_name in ['if', 'while', 'for', 'switch']:
+                continue
+            
+            # Find the function body by matching braces
+            start_pos = match.end() - 1  # Start from opening brace
+            brace_count = 1
+            i = start_pos + 1
+            
+            while i < len(code) and brace_count > 0:
+                # Handle string literals to avoid counting braces inside strings
+                if code[i] == '"':
+                    i += 1
+                    while i < len(code) and code[i] != '"':
+                        if code[i] == '\\':
+                            i += 1  # Skip escape sequences
+                        i += 1
+                    if i < len(code):
+                        i += 1
+                    continue
+                
+                if code[i] == '{':
+                    brace_count += 1
+                elif code[i] == '}':
+                    brace_count -= 1
+                i += 1
+            
+            if brace_count == 0:
+                body = code[start_pos+1:i-1]  # Extract body without braces
+                
+                # Extract return type (everything before function name)
+                before_name = code[:match.start()].strip()
+                return_type = before_name.split()[-1] if before_name else "void"
+                
+                functions.append({
+                    'name': func_name,
+                    'return_type': return_type,
+                    'body': body,
+                    'start': match.start(),
+                    'end': i
+                })
+        
+        return functions
+    
+    @staticmethod
+    def _extract_cfg_from_function(func_info: Dict) -> CFG:
+        """Extract CFG from a single function using simplified parsing"""
+        function_name = func_info['name']
+        body = func_info['body'].strip()
+        
+        cfg = CFG(function=function_name)
+        node_id = 1
+        
+        # Create entry node
+        entry_node = CFGNode(id=node_id, type="entry")
+        cfg.nodes.append(entry_node)
+        entry_id = node_id
+        node_id += 1
+        
+        # Simple tokenization: split by common delimiters while preserving structure
+        # Remove braces for now, process sequentially
+        tokens = re.split(r'[;\{\}]', body)
+        
+        prev_node_id = entry_id
+        condition_stack = []  # Track nested conditions
+        
+        for token in tokens:
+            token = token.strip()
+            if not token or len(token) < 2:
+                continue
+            
+            # Detect if statements
+            if_match = re.match(r'if\s*\(([^)]+)\)', token)
+            if if_match:
+                condition = if_match.group(1).strip()
+                if condition:
+                    cond_node = CFGNode(id=node_id, type="condition", expr=condition)
+                    cfg.nodes.append(cond_node)
+                    cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
+                    
+                    condition_stack.append({'node_id': node_id, 'type': 'if'})
+                    prev_node_id = node_id
+                    node_id += 1
+                    continue
+            
+            # Detect else
+            if re.match(r'else', token):
+                if condition_stack:
+                    cond_info = condition_stack[-1]
+                    if cond_info['type'] == 'if':
+                        # Add false branch edge
+                        false_node_id = node_id
+                        cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=false_node_id, label="false"))
+                        prev_node_id = false_node_id
+                        node_id += 1
+                continue
+            
+            # Detect return statements
+            if re.match(r'return', token):
+                return_node = CFGNode(id=node_id, type="return")
+                cfg.nodes.append(return_node)
+                cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
+                prev_node_id = node_id
+                node_id += 1
+                continue
+            
+            # Detect function calls (simplified - look for identifier followed by parentheses)
+            call_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)'
+            calls = re.findall(call_pattern, token)
+            
+            # Filter out C++ keywords
+            cpp_keywords = {'if', 'while', 'for', 'switch', 'return', 'new', 'delete', 
+                          'throw', 'try', 'catch', 'sizeof', 'typeid', 'static_cast',
+                          'dynamic_cast', 'const_cast', 'reinterpret_cast'}
+            
+            for callee in calls:
+                if callee not in cpp_keywords and len(callee) > 1:
+                    call_node = CFGNode(id=node_id, type="call", callee=callee)
+                    cfg.nodes.append(call_node)
+                    cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
+                    prev_node_id = node_id
+                    node_id += 1
+                    break  # Only take first call per token
+            
+            # For condition nodes, ensure true branch exists
+            if condition_stack:
+                top_cond = condition_stack[-1]
+                if top_cond['type'] == 'if' and not any(e.from_node == top_cond['node_id'] and e.label == "true" for e in cfg.edges):
+                    # Add true branch
+                    true_node_id = node_id
+                    cfg.edges.append(CFGEdge(from_node=top_cond['node_id'], to_node=true_node_id, label="true"))
+                    prev_node_id = true_node_id
+                    node_id += 1
+                    # Pop condition after processing
+                    condition_stack.pop()
+        
+        # Ensure all condition nodes have both branches
+        for cond_info in condition_stack:
+            if not any(e.from_node == cond_info['node_id'] and e.label == "true" for e in cfg.edges):
+                true_node_id = node_id
+                cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=true_node_id, label="true"))
+                node_id += 1
+            if not any(e.from_node == cond_info['node_id'] and e.label == "false" for e in cfg.edges):
+                false_node_id = node_id
+                cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=false_node_id, label="false"))
+                node_id += 1
+        
+        # Ensure return node exists
+        has_return = any(node.type == "return" for node in cfg.nodes)
+        if not has_return:
+            return_node = CFGNode(id=node_id, type="return")
+            cfg.nodes.append(return_node)
+            # Connect all nodes without outgoing edges to return
+            nodes_with_outgoing = {e.from_node for e in cfg.edges}
+            nodes_to_connect = [n.id for n in cfg.nodes if n.id not in nodes_with_outgoing and n.type != "return" and n.id != entry_id]
+            if nodes_to_connect:
+                for node_id_to_connect in nodes_to_connect:
+                    cfg.edges.append(CFGEdge(from_node=node_id_to_connect, to_node=node_id))
+            else:
+                cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
+        
+        # Ensure entry node connects to something
+        if not any(e.from_node == entry_id for e in cfg.edges):
+            first_non_entry = [n.id for n in cfg.nodes if n.id != entry_id]
+            if first_non_entry:
+                cfg.edges.insert(0, CFGEdge(from_node=entry_id, to_node=first_non_entry[0]))
+        
+        return cfg
+    
+    @staticmethod
     def build_from_source(source_dir: str, function_name: Optional[str] = None) -> Optional[CFG]:
         """
         Build CFG from C++ source directory.
         
-        TODO: Replace with Clang LibTooling integration
-        For now, uses a mock/placeholder extractor.
+        Implements a basic C++ parser to extract CFG.
+        Note: For production use, replace with Clang LibTooling integration.
         """
         # Find C++ files
         cpp_files = []
-        for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++']:
+        for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++', '*.hpp', '*.h']:
             cpp_files.extend(glob.glob(os.path.join(source_dir, ext)))
             cpp_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
         
         if not cpp_files:
-            print(f"Warning: No C++ files found in {source_dir}")
+            print(f"  Warning: No C++ files found in {source_dir}")
             return None
         
-        # For now, try to load pre-existing CFG JSON if available
+        # Try to load pre-existing CFG JSON if available
         cfg_file = os.path.join(source_dir, 'cfg.json')
         if os.path.exists(cfg_file):
             try:
                 with open(cfg_file, 'r') as f:
                     cfg_json = json.load(f)
+                print(f"  [OK] Loaded existing CFG from: {cfg_file}")
                 return parse_cfg(cfg_json)
             except Exception as e:
-                print(f"Warning: Could not load existing cfg.json: {e}")
+                print(f"  [WARNING] Could not load existing CFG: {e}")
         
-        # Placeholder: Return None if CFG cannot be built
-        # In production, this would call Clang LibTooling
-        print("[WARNING] CFG Builder: Using placeholder. Replace with Clang LibTooling integration.")
-        print("  To use: Provide cfg.json file or implement Clang integration.")
-        return None
+        # Parse C++ files
+        print(f"  [INFO] Parsing {min(len(cpp_files), 10)} C++ file(s) (limited for performance)...")
+        print("  [NOTE] Using heuristic-based parser. For production, use Clang LibTooling.")
+        
+        all_functions = []
+        for cpp_file in cpp_files[:10]:  # Limit to first 10 files for performance
+            code = CFGBuilder._read_cpp_file(cpp_file)
+            if not code:
+                continue
+            
+            preprocessed = CFGBuilder._preprocess_code(code)
+            functions = CFGBuilder._find_functions(preprocessed)
+            
+            for func in functions:
+                # Only add functions with non-empty bodies
+                if func['body'].strip():
+                    func['file'] = os.path.basename(cpp_file)
+                    all_functions.append(func)
+        
+        if not all_functions:
+            print("  [WARNING] No functions with bodies found in C++ files")
+            print("  [INFO] Using minimal placeholder CFG. For accurate results, use Clang LibTooling.")
+            # Return a minimal CFG
+            cfg = CFG(function=function_name or "unknown")
+            cfg.nodes.append(CFGNode(id=1, type="entry"))
+            cfg.nodes.append(CFGNode(id=2, type="return"))
+            cfg.edges.append(CFGEdge(from_node=1, to_node=2))
+            return cfg
+        
+        # Select function to analyze
+        selected_func = None
+        if function_name:
+            for func in all_functions:
+                if func['name'] == function_name or func['name'].endswith('::' + function_name):
+                    selected_func = func
+                    break
+        
+        if not selected_func:
+            # Use first function found
+            selected_func = all_functions[0]
+            print(f"  [INFO] Analyzing function: {selected_func['name']} (from {selected_func['file']})")
+            if len(all_functions) > 1:
+                print(f"  [NOTE] Found {len(all_functions)} functions. Analyzing first one.")
+                print(f"  [TIP] To analyze specific function, implement function name filtering.")
+        
+        # Extract CFG
+        try:
+            cfg = CFGBuilder._extract_cfg_from_function(selected_func)
+            if cfg.nodes and cfg.edges:
+                print(f"  [OK] Built CFG for function: {cfg.function}")
+                print(f"  [NOTE] CFG extracted using heuristic parser. For production accuracy, use Clang LibTooling.")
+            else:
+                print(f"  [WARNING] CFG extraction produced empty result")
+                # Return minimal CFG
+                cfg = CFG(function=selected_func['name'])
+                cfg.nodes.append(CFGNode(id=1, type="entry"))
+                cfg.nodes.append(CFGNode(id=2, type="return"))
+                cfg.edges.append(CFGEdge(from_node=1, to_node=2))
+            return cfg
+        except Exception as e:
+            print(f"  [ERROR] Failed to extract CFG: {e}")
+            print("  [INFO] Using minimal CFG. For accurate extraction, use Clang LibTooling integration.")
+            import traceback
+            if __debug__:
+                traceback.print_exc()
+            # Return minimal CFG
+            cfg = CFG(function=selected_func['name'] if selected_func else "unknown")
+            cfg.nodes.append(CFGNode(id=1, type="entry"))
+            cfg.nodes.append(CFGNode(id=2, type="return"))
+            cfg.edges.append(CFGEdge(from_node=1, to_node=2))
+            return cfg
     
     @staticmethod
     def save_cfg(cfg: CFG, output_file: str = "cfg.json"):
@@ -683,7 +982,15 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
     
     # Step 1: Load C++ source directory
     if not os.path.isdir(source_dir):
-        print(f"Error: Source directory does not exist: {source_dir}")
+        if source_dir.startswith('http://') or source_dir.startswith('https://'):
+            print(f"Error: Agent requires a local directory path, not a URL.")
+            print(f"  Please clone the repository first:")
+            print(f"    git clone {source_dir}")
+            print(f"  Then run:")
+            print(f"    python agent.py <local_cloned_directory>")
+        else:
+            print(f"Error: Source directory does not exist: {source_dir}")
+            print(f"  Make sure the path is correct and points to a local directory.")
         sys.exit(1)
     
     # Step 2: Build CFG JSON
