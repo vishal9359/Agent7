@@ -1,0 +1,6 @@
+# Agent7 - LLM-Assisted C++ Program Understanding Agent
+# Python 3.x required
+# 
+# This implementation uses only Python standard library.
+# No external dependencies required.
+
