@@ -296,10 +296,11 @@ class CFGBuilder:
                 if condition_stack:
                     cond_info = condition_stack[-1]
                     if cond_info['type'] == 'if':
-                        # Add false branch edge
-                        false_node_id = node_id
-                        cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=false_node_id, label="false"))
-                        prev_node_id = false_node_id
+                        # Add false branch node and edge
+                        false_node = CFGNode(id=node_id, type="statement")
+                        cfg.nodes.append(false_node)
+                        cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=node_id, label="false"))
+                        prev_node_id = node_id
                         node_id += 1
                 continue
             
@@ -334,10 +335,11 @@ class CFGBuilder:
             if condition_stack:
                 top_cond = condition_stack[-1]
                 if top_cond['type'] == 'if' and not any(e.from_node == top_cond['node_id'] and e.label == "true" for e in cfg.edges):
-                    # Add true branch
-                    true_node_id = node_id
-                    cfg.edges.append(CFGEdge(from_node=top_cond['node_id'], to_node=true_node_id, label="true"))
-                    prev_node_id = true_node_id
+                    # Add true branch node and edge
+                    true_node = CFGNode(id=node_id, type="statement")
+                    cfg.nodes.append(true_node)
+                    cfg.edges.append(CFGEdge(from_node=top_cond['node_id'], to_node=node_id, label="true"))
+                    prev_node_id = node_id
                     node_id += 1
                     # Pop condition after processing
                     condition_stack.pop()
@@ -345,12 +347,16 @@ class CFGBuilder:
         # Ensure all condition nodes have both branches
         for cond_info in condition_stack:
             if not any(e.from_node == cond_info['node_id'] and e.label == "true" for e in cfg.edges):
-                true_node_id = node_id
-                cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=true_node_id, label="true"))
+                # Create true branch node
+                true_node = CFGNode(id=node_id, type="statement")
+                cfg.nodes.append(true_node)
+                cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=node_id, label="true"))
                 node_id += 1
             if not any(e.from_node == cond_info['node_id'] and e.label == "false" for e in cfg.edges):
-                false_node_id = node_id
-                cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=false_node_id, label="false"))
+                # Create false branch node
+                false_node = CFGNode(id=node_id, type="statement")
+                cfg.nodes.append(false_node)
+                cfg.edges.append(CFGEdge(from_node=cond_info['node_id'], to_node=node_id, label="false"))
                 node_id += 1
         
         # Ensure return node exists
@@ -372,6 +378,25 @@ class CFGBuilder:
             first_non_entry = [n.id for n in cfg.nodes if n.id != entry_id]
             if first_non_entry:
                 cfg.edges.insert(0, CFGEdge(from_node=entry_id, to_node=first_non_entry[0]))
+        
+        # Final cleanup: Remove any edges that reference non-existent nodes
+        valid_node_ids = {node.id for node in cfg.nodes}
+        valid_edges = []
+        for edge in cfg.edges:
+            if edge.from_node in valid_node_ids and edge.to_node in valid_node_ids:
+                valid_edges.append(edge)
+            else:
+                # Skip invalid edge
+                pass
+        
+        cfg.edges = valid_edges
+        
+        # Ensure all nodes with no incoming edges (except entry) connect from entry
+        nodes_with_incoming = {e.to_node for e in cfg.edges}
+        orphaned_nodes = [n.id for n in cfg.nodes if n.id != entry_id and n.id not in nodes_with_incoming]
+        for orphan_id in orphaned_nodes:
+            if not any(e.from_node == entry_id and e.to_node == orphan_id for e in cfg.edges):
+                cfg.edges.insert(0, CFGEdge(from_node=entry_id, to_node=orphan_id))
         
         return cfg
     
