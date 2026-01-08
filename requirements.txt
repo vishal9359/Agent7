@@ -1,6 +1,14 @@
 # Agent7 - LLM-Assisted C++ Program Understanding Agent
 # Python 3.x required
-# 
-# This implementation uses only Python standard library.
-# No external dependencies required.
+
+# Clang integration (REQUIRED)
+clang>=16.0.0
+
+# Note: You also need libclang installed on your system:
+# - Ubuntu/Debian: sudo apt-get install libclang-dev
+# - macOS: brew install llvm
+# - Windows: Download LLVM from llvm.org
+#
+# Set LIBCLANG_LIBRARY_PATH environment variable if needed:
+# export LIBCLANG_LIBRARY_PATH=/usr/lib/llvm-16/lib/libclang.so
 

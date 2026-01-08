@@ -29,6 +29,15 @@ from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
+# Clang integration
+try:
+    from clang.cindex import Index, TranslationUnit, Cursor, CursorKind, SourceLocation
+    CLANG_AVAILABLE = True
+except ImportError:
+    CLANG_AVAILABLE = False
+    print("[ERROR] clang.cindex not available. Install with: pip install clang")
+    print("  Or install libclang and set LIBCLANG_LIBRARY_PATH environment variable.")
+
 
 # ============================================================================
 # DATA MODELS
@@ -94,6 +103,34 @@ class CallGraph:
     calls: Dict[str, List[str]] = field(default_factory=dict)
 
 
+@dataclass
+class FunctionInfo:
+    """Information about a discovered function"""
+    name: str
+    source_file: str
+    full_name: str = ""  # with namespace/class
+    cfg: Optional[CFG] = None
+    description: Optional[Description] = None
+
+
+@dataclass
+class FunctionRegistry:
+    """Registry to track all discovered functions"""
+    functions: Dict[str, FunctionInfo] = field(default_factory=dict)
+    
+    def add_function(self, func_info: FunctionInfo):
+        """Add a function to the registry"""
+        self.functions[func_info.name] = func_info
+    
+    def get_function(self, name: str) -> Optional[FunctionInfo]:
+        """Get function by name"""
+        return self.functions.get(name)
+    
+    def get_all_functions(self) -> List[FunctionInfo]:
+        """Get all registered functions"""
+        return list(self.functions.values())
+
+
 # ============================================================================
 # JSON PARSING
 # ============================================================================
@@ -152,6 +189,267 @@ def parse_description(desc_json: dict) -> Description:
             desc.issues = func_desc.get("issues", [])
     
     return desc
+
+
+# ============================================================================
+# MODULE A: CLANG INTEGRATION LAYER
+# ============================================================================
+
+class ClangIntegration:
+    """Clang integration for AST traversal and CFG extraction"""
+    
+    @staticmethod
+    def check_clang_available() -> bool:
+        """Check if Clang is available"""
+        if not CLANG_AVAILABLE:
+            return False
+        try:
+            Index.create()
+            return True
+        except Exception as e:
+            print(f"[ERROR] Clang initialization failed: {e}")
+            return False
+    
+    @staticmethod
+    def discover_all_functions(source_dir: str) -> List[FunctionInfo]:
+        """
+        Discover all function definitions using Clang AST.
+        
+        Returns list of FunctionInfo objects.
+        """
+        if not ClangIntegration.check_clang_available():
+            raise RuntimeError(
+                "Clang is not available. Please install:\n"
+                "  1. Install libclang (system package manager)\n"
+                "  2. pip install clang\n"
+                "  3. Set LIBCLANG_LIBRARY_PATH if needed\n"
+                "DO NOT continue without Clang - this is required."
+            )
+        
+        functions = []
+        index = Index.create()
+        
+        # Find all C++ files
+        cpp_files = []
+        for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++']:
+            cpp_files.extend(glob.glob(os.path.join(source_dir, ext)))
+            cpp_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
+        
+        if not cpp_files:
+            print(f"[WARNING] No C++ files found in {source_dir}")
+            return functions
+        
+        # Try to find compile_commands.json
+        compile_commands = None
+        compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
+        if not os.path.exists(compile_commands_path):
+            # Check parent directories
+            parent = os.path.dirname(source_dir)
+            compile_commands_path = os.path.join(parent, 'compile_commands.json')
+        
+        args = ['-std=c++17', '-x', 'c++']
+        if os.path.exists(compile_commands_path):
+            try:
+                with open(compile_commands_path, 'r') as f:
+                    compile_commands = json.load(f)
+                print(f"  [OK] Found compile_commands.json")
+            except Exception as e:
+                print(f"  [WARNING] Could not parse compile_commands.json: {e}")
+        
+        print(f"  [INFO] Parsing {len(cpp_files)} C++ file(s) with Clang...")
+        
+        for cpp_file in cpp_files[:50]:  # Limit to 50 files for performance
+            try:
+                # Parse translation unit
+                tu = index.parse(cpp_file, args=args)
+                
+                # Walk AST to find function definitions
+                def visit_node(cursor: Cursor):
+                    if cursor.kind == CursorKind.FUNCTION_DECL:
+                        # Get function name
+                        func_name = cursor.spelling
+                        if not func_name:
+                            return
+                        
+                        # Skip if it's a declaration without definition
+                        if not cursor.is_definition():
+                            return
+                        
+                        # Get full qualified name
+                        full_name = ClangIntegration._get_qualified_name(cursor)
+                        
+                        func_info = FunctionInfo(
+                            name=func_name,
+                            source_file=os.path.basename(cpp_file),
+                            full_name=full_name
+                        )
+                        functions.append(func_info)
+                    
+                    # Recurse into children
+                    for child in cursor.get_children():
+                        visit_node(child)
+                
+                visit_node(tu.cursor)
+                
+            except Exception as e:
+                print(f"  [WARNING] Failed to parse {cpp_file}: {e}")
+                continue
+        
+        print(f"  [OK] Discovered {len(functions)} function(s)")
+        return functions
+    
+    @staticmethod
+    def _get_qualified_name(cursor: Cursor) -> str:
+        """Get fully qualified function name"""
+        parts = []
+        current = cursor
+        
+        while current:
+            if current.kind == CursorKind.FUNCTION_DECL:
+                parts.insert(0, current.spelling)
+            elif current.kind in [CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL]:
+                parts.insert(0, current.spelling)
+            elif current.kind == CursorKind.NAMESPACE:
+                parts.insert(0, current.spelling)
+            current = current.semantic_parent
+        
+        return '::'.join(filter(None, parts))
+    
+    @staticmethod
+    def build_cfg_from_clang(source_file: str, function_name: str) -> Optional[CFG]:
+        """
+        Build CFG for a specific function using Clang's CFG.
+        
+        Note: Clang's CFG API is complex. This is a simplified implementation
+        that extracts basic control flow. For production, use full Clang CFG API.
+        """
+        if not ClangIntegration.check_clang_available():
+            return None
+        
+        index = Index.create()
+        args = ['-std=c++17', '-x', 'c++']
+        
+        try:
+            tu = index.parse(source_file, args=args)
+            target_func = None
+            
+            # Find the function
+            def find_function(cursor: Cursor):
+                nonlocal target_func
+                if cursor.kind == CursorKind.FUNCTION_DECL and cursor.is_definition():
+                    if cursor.spelling == function_name:
+                        target_func = cursor
+                        return
+                for child in cursor.get_children():
+                    find_function(child)
+            
+            find_function(tu.cursor)
+            
+            if not target_func:
+                return None
+            
+            # Extract CFG (simplified - using AST traversal)
+            return ClangIntegration._extract_cfg_from_cursor(target_func, function_name)
+            
+        except Exception as e:
+            print(f"  [ERROR] Clang CFG extraction failed: {e}")
+            return None
+    
+    @staticmethod
+    def _extract_cfg_from_cursor(cursor: Cursor, function_name: str) -> CFG:
+        """Extract CFG from Clang cursor (simplified implementation)"""
+        cfg = CFG(function=function_name)
+        node_id = 1
+        
+        # Create entry node
+        entry_node = CFGNode(id=node_id, type="entry")
+        cfg.nodes.append(entry_node)
+        entry_id = node_id
+        node_id += 1
+        
+        # Walk the function body to extract control flow
+        prev_node_id = entry_id
+        
+        def process_statement(stmt_cursor: Cursor, prev_id: int) -> int:
+            nonlocal node_id
+            
+            if stmt_cursor.kind == CursorKind.IF_STMT:
+                # Extract condition
+                cond_text = ""
+                for child in stmt_cursor.get_children():
+                    if child.kind == CursorKind.BINARY_OPERATOR or child.kind == CursorKind.UNEXPOSED_EXPR:
+                        # Try to get condition text
+                        tokens = [token.spelling for token in child.get_tokens()]
+                        cond_text = ' '.join(tokens)
+                        break
+                
+                if not cond_text:
+                    cond_text = "condition"
+                
+                # Create condition node
+                cond_node = CFGNode(id=node_id, type="condition", expr=cond_text)
+                cfg.nodes.append(cond_node)
+                cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
+                cond_id = node_id
+                node_id += 1
+                
+                # Process then branch
+                then_id = node_id
+                node_id += 1
+                then_node = CFGNode(id=then_id, type="statement")
+                cfg.nodes.append(then_node)
+                cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
+                
+                # Process else branch if exists
+                has_else = False
+                children = list(stmt_cursor.get_children())
+                if len(children) >= 3:
+                    else_id = node_id
+                    node_id += 1
+                    else_node = CFGNode(id=else_id, type="statement")
+                    cfg.nodes.append(else_node)
+                    cfg.edges.append(CFGEdge(from_node=cond_id, to_node=else_id, label="false"))
+                    has_else = True
+                
+                return then_id if has_else else cond_id
+                
+            elif stmt_cursor.kind == CursorKind.CALL_EXPR:
+                # Function call
+                callee = stmt_cursor.spelling or "unknown"
+                call_node = CFGNode(id=node_id, type="call", callee=callee)
+                cfg.nodes.append(call_node)
+                cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
+                node_id += 1
+                return node_id - 1
+                
+            elif stmt_cursor.kind == CursorKind.RETURN_STMT:
+                return_node = CFGNode(id=node_id, type="return")
+                cfg.nodes.append(return_node)
+                cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
+                node_id += 1
+                return node_id - 1
+            
+            # Default: statement node
+            stmt_node = CFGNode(id=node_id, type="statement")
+            cfg.nodes.append(stmt_node)
+            cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
+            node_id += 1
+            return node_id - 1
+        
+        # Process function body
+        for child in cursor.get_children():
+            if child.kind == CursorKind.COMPOUND_STMT:
+                for stmt in child.get_children():
+                    prev_node_id = process_statement(stmt, prev_node_id)
+        
+        # Ensure return node exists
+        has_return = any(n.type == "return" for n in cfg.nodes)
+        if not has_return:
+            return_node = CFGNode(id=node_id, type="return")
+            cfg.nodes.append(return_node)
+            cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
+        
+        return cfg
 
 
 # ============================================================================
@@ -399,6 +697,67 @@ class CFGBuilder:
                 cfg.edges.insert(0, CFGEdge(from_node=entry_id, to_node=orphan_id))
         
         return cfg
+    
+    @staticmethod
+    def build_all_cfgs_from_source(source_dir: str) -> List[CFG]:
+        """
+        Build CFGs for ALL functions in the source directory.
+        
+        Returns list of CFGs, one per function.
+        """
+        cfgs = []
+        
+        # Try Clang first
+        if ClangIntegration.check_clang_available():
+            try:
+                functions = ClangIntegration.discover_all_functions(source_dir)
+                
+                if not functions:
+                    print("  [WARNING] Clang found no functions")
+                    return cfgs
+                
+                # Find source files
+                source_files_map = {}
+                cpp_files = []
+                for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++']:
+                    cpp_files.extend(glob.glob(os.path.join(source_dir, ext)))
+                    cpp_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
+                
+                for cpp_file in cpp_files:
+                    basename = os.path.basename(cpp_file)
+                    source_files_map[basename] = cpp_file
+                
+                # Build CFG for each function
+                for func_info in functions:
+                    source_file = source_files_map.get(func_info.source_file)
+                    if not source_file:
+                        # Try to find file by name
+                        for cpp_file in cpp_files:
+                            if func_info.source_file in cpp_file or os.path.basename(cpp_file) == func_info.source_file:
+                                source_file = cpp_file
+                                break
+                    
+                    if source_file:
+                        cfg = ClangIntegration.build_cfg_from_clang(source_file, func_info.name)
+                        if cfg:
+                            cfgs.append(cfg)
+                        else:
+                            print(f"  [WARNING] Failed to build CFG for {func_info.name}")
+                
+                return cfgs
+                
+            except Exception as e:
+                print(f"  [ERROR] Clang processing failed: {e}")
+                raise  # Fail clearly, don't fallback
+        
+        # If we reach here, Clang is not available
+        raise RuntimeError(
+            "Clang is REQUIRED but not available.\n"
+            "Install Clang:\n"
+            "  1. System: sudo apt-get install libclang-dev (Ubuntu) or brew install llvm (macOS)\n"
+            "  2. Python: pip install clang\n"
+            "  3. Set LIBCLANG_LIBRARY_PATH if needed\n"
+        )
     
     @staticmethod
     def build_from_source(source_dir: str, function_name: Optional[str] = None) -> Optional[CFG]:
@@ -1002,7 +1361,7 @@ class PrimaryAnalysisAgent:
 # ============================================================================
 
 def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool = False):
-    """Build CFG, CallGraph, and Description from C++ source directory"""
+    """Build CFG, CallGraph, and Description for ALL functions in C++ source directory"""
     print(f"[INFO] Building from source directory: {source_dir}\n")
     
     # Step 1: Load C++ source directory
@@ -1018,175 +1377,224 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
             print(f"  Make sure the path is correct and points to a local directory.")
         sys.exit(1)
     
-    # Step 2: Build CFG JSON
-    print("Step 2: Building CFG JSON...")
-    cfg = None
+    # Step 2: Initialize Clang and discover ALL functions
+    print("Step 2: Initializing Clang and discovering ALL functions...")
     
-    if reuse_json:
-        cfg_file = os.path.join(source_dir, "cfg.json")
-        if os.path.exists(cfg_file):
-            try:
-                with open(cfg_file, 'r') as f:
-                    cfg_json = json.load(f)
-                cfg = parse_cfg(cfg_json)
-                print(f"  [OK] Loaded existing CFG from: {cfg_file}")
-            except Exception as e:
-                print(f"  [WARNING] Could not load existing CFG: {e}")
+    if not ClangIntegration.check_clang_available():
+        print("[ERROR] Clang is REQUIRED but not available.")
+        print("Install Clang:")
+        print("  1. System: sudo apt-get install libclang-dev (Ubuntu) or brew install llvm (macOS)")
+        print("  2. Python: pip install clang")
+        print("  3. Set LIBCLANG_LIBRARY_PATH if needed")
+        sys.exit(1)
     
-    if cfg is None:
-        cfg = CFGBuilder.build_from_source(source_dir)
+    try:
+        all_functions = ClangIntegration.discover_all_functions(source_dir)
+    except Exception as e:
+        print(f"  [ERROR] Function discovery failed: {e}")
+        sys.exit(1)
+    
+    if len(all_functions) == 0:
+        print("  [ERROR] No functions found. Aborting.")
+        sys.exit(1)
+    
+    if len(all_functions) == 1:
+        print("  [WARNING] Only one function detected. This may indicate a problem.")
+    
+    print(f"  [OK] Discovered {len(all_functions)} function(s)")
+    
+    # Step 3: Create output directory structure
+    output_dir = os.path.join(source_dir, "output")
+    if not dry_run:
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "cfg"), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "description"), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "diagrams"), exist_ok=True)
+    
+    # Step 4: Process EACH function
+    print(f"\nStep 4: Processing {len(all_functions)} function(s)...")
+    
+    registry = FunctionRegistry()
+    all_cfgs = []
+    global_callgraph = CallGraph()
+    
+    # Find source files
+    source_files_map = {}
+    cpp_files = []
+    for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++']:
+        cpp_files.extend(glob.glob(os.path.join(source_dir, ext)))
+        cpp_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
+    
+    for cpp_file in cpp_files:
+        basename = os.path.basename(cpp_file)
+        source_files_map[basename] = cpp_file
+    
+    for func_info in all_functions:
+        func_name = func_info.name
+        print(f"\n  Processing function: {func_name}")
+        
+        # Find source file
+        source_file = source_files_map.get(func_info.source_file)
+        if not source_file:
+            for cpp_file in cpp_files:
+                if func_info.source_file in cpp_file or os.path.basename(cpp_file) == func_info.source_file:
+                    source_file = cpp_file
+                    break
+        
+        if not source_file:
+            print(f"    [WARNING] Source file not found for {func_name}, skipping")
+            continue
+        
+        # Build CFG using Clang
+        cfg = None
+        try:
+            cfg = ClangIntegration.build_cfg_from_clang(source_file, func_name)
+            if not cfg or not cfg.nodes or len(cfg.nodes) < 2:
+                print(f"    [WARNING] Clang CFG extraction incomplete for {func_name}, using fallback")
+                cfg = None
+        except Exception as e:
+            print(f"    [WARNING] Clang CFG extraction failed for {func_name}: {e}")
+            cfg = None
+        
+        # Fallback to heuristic parser if Clang CFG extraction failed
         if cfg is None:
-            print("  [ERROR] Cannot build CFG. Aborting.")
-            sys.exit(1)
-        print(f"  [OK] Built CFG for function: {cfg.function}")
-    
-    print(f"  Nodes: {len(cfg.nodes)}, Edges: {len(cfg.edges)}")
-    
-    # Step 3: Validate CFG JSON
-    print("\nStep 3: Validating CFG JSON...")
-    cfg_validator = CFGValidationAgent()
-    is_valid, issues = cfg_validator.validate(cfg)
-    
-    if not is_valid:
-        print("  [ERROR] CFG validation FAILED:")
-        for issue in issues:
-            print(f"    - {issue}")
-        print("  Aborting due to CFG validation failure.")
-        sys.exit(1)
-    
-    print("  [OK] CFG validation PASSED")
-    
-    # Save CFG if not dry run
-    if not dry_run:
-        cfg_output = os.path.join(source_dir, "cfg.json")
-        CFGBuilder.save_cfg(cfg, cfg_output)
-        print(f"  [OK] Saved CFG to: {cfg_output}")
-    
-    # Step 4: Build CallGraph JSON
-    print("\nStep 4: Building CallGraph JSON...")
-    callgraph = None
-    
-    if reuse_json:
-        cg_file = os.path.join(source_dir, "callgraph.json")
-        if os.path.exists(cg_file):
             try:
-                with open(cg_file, 'r') as f:
-                    cg_json = json.load(f)
-                callgraph = parse_callgraph(cg_json)
-                print(f"  [OK] Loaded existing CallGraph from: {cg_file}")
-            except Exception as e:
-                print(f"  [WARNING] Could not load existing CallGraph: {e}")
-    
-    if callgraph is None:
-        # First try to build from source, then fall back to CFG
-        callgraph = CallGraphBuilder.build_from_source(source_dir)
-        if not callgraph.calls:
-            callgraph = CallGraphBuilder.build_from_cfg(cfg)
-            print("  [OK] Built CallGraph from CFG")
-        else:
-            print("  [OK] Built CallGraph from source")
-    
-    print(f"  Functions: {len(callgraph.calls)}")
-    
-    # Step 5: Validate CallGraph JSON
-    print("\nStep 5: Validating CallGraph JSON...")
-    cg_validator = CallGraphValidationAgent()
-    is_valid, issues = cg_validator.validate(callgraph, cfg)
-    
-    if not is_valid:
-        print("  [WARNING] CallGraph validation found issues:")
-        for issue in issues:
-            print(f"    - {issue}")
-    else:
-        print("  [OK] CallGraph validation PASSED")
-    
-    # Save CallGraph if not dry run
-    if not dry_run:
-        cg_output = os.path.join(source_dir, "callgraph.json")
-        CallGraphBuilder.save_callgraph(callgraph, cg_output)
-        print(f"  [OK] Saved CallGraph to: {cg_output}")
-    
-    # Step 6: Build initial Description JSON
-    print("\nStep 6: Building initial Description JSON...")
-    desc = DescriptionBuilder.build_from_cfg(cfg, callgraph)
-    print(f"  [OK] Built Description for: {desc.function}")
-    
-    # Step 7: Validate & correct Description JSON
-    print("\nStep 7: Validating & correcting Description JSON...")
-    desc_validator = DescriptionValidationAgent()
-    is_valid, corrected_desc, justification = desc_validator.validate(desc, cfg, callgraph)
-    
-    if not is_valid:
-        print(f"  [WARNING] Description validation FAILED: {justification}")
-        desc = corrected_desc
-        print("  [OK] Description corrected")
-    else:
-        print(f"  [OK] Description validation PASSED: {justification}")
-    
-    # Save Description if not dry run
-    if not dry_run:
-        desc_output = os.path.join(source_dir, "description.json")
-        DescriptionBuilder.save_description(desc, desc_output)
-        print(f"  [OK] Saved Description to: {desc_output}")
-    
-    # Step 8: Generate Mermaid diagram
-    print("\nStep 8: Generating Mermaid diagram...")
-    primary_agent = PrimaryAnalysisAgent()
-    mermaid = primary_agent.generate_mermaid(cfg, desc)
-    print("  [OK] Generated Mermaid diagram")
-    
-    # Step 9: Validate Mermaid diagram
-    print("\nStep 9: Validating Mermaid diagram...")
-    diagram_validator = DiagramValidationAgent()
-    is_valid, corrected_mermaid, issues = diagram_validator.validate(mermaid, cfg)
-    
-    validation_attempts = 1
-    while not is_valid and validation_attempts < 3:
-        print(f"  [WARNING] Diagram validation FAILED (attempt {validation_attempts})")
-        for issue in issues:
-            print(f"    - {issue}")
+                # Read file and use heuristic parser
+                code = CFGBuilder._read_cpp_file(source_file)
+                if code:
+                    preprocessed = CFGBuilder._preprocess_code(code)
+                    functions = CFGBuilder._find_functions(preprocessed)
+                    selected_func = None
+                    for f in functions:
+                        if f['name'] == func_name:
+                            selected_func = f
+                            break
+                    
+                    if selected_func:
+                        cfg = CFGBuilder._extract_cfg_from_function(selected_func)
+                        print(f"    [INFO] Using heuristic parser fallback for {func_name}")
+            except Exception as e2:
+                print(f"    [ERROR] All CFG extraction methods failed for {func_name}: {e2}")
+                print(f"    Aborting due to CFG build failure.")
+                sys.exit(1)
         
-        mermaid = corrected_mermaid
+        if not cfg or not cfg.nodes:
+            print(f"    [ERROR] Could not build CFG for {func_name}, skipping")
+            continue
+        
+        # Validate CFG
+        cfg_validator = CFGValidationAgent()
+        is_valid, issues = cfg_validator.validate(cfg)
+        
+        if not is_valid:
+            print(f"    [ERROR] CFG validation FAILED for {func_name}:")
+            for issue in issues:
+                print(f"      - {issue}")
+            print(f"    Aborting due to CFG validation failure.")
+            sys.exit(1)
+        
+        all_cfgs.append(cfg)
+        func_info.cfg = cfg
+        
+        # Build CallGraph for this function
+        func_callgraph = CallGraphBuilder.build_from_cfg(cfg)
+        if cfg.function:
+            global_callgraph.calls[cfg.function] = func_callgraph.calls.get(cfg.function, [])
+        
+        # Build Description
+        desc = DescriptionBuilder.build_from_cfg(cfg, global_callgraph)
+        
+        # Validate Description
+        desc_validator = DescriptionValidationAgent()
+        is_valid, corrected_desc, justification = desc_validator.validate(desc, cfg, global_callgraph)
+        if not is_valid:
+            desc = corrected_desc
+        
+        func_info.description = desc
+        
+        # Generate Mermaid
+        primary_agent = PrimaryAnalysisAgent()
+        mermaid = primary_agent.generate_mermaid(cfg, desc)
+        
+        # Validate Mermaid
+        diagram_validator = DiagramValidationAgent()
         is_valid, corrected_mermaid, issues = diagram_validator.validate(mermaid, cfg)
-        validation_attempts += 1
+        if not is_valid:
+            mermaid = corrected_mermaid
+        
+        # Save artifacts for this function
+        if not dry_run:
+            safe_func_name = func_name.replace(':', '_').replace('/', '_').replace('\\', '_')
+            
+            # Save CFG
+            cfg_path = os.path.join(output_dir, "cfg", f"{safe_func_name}.json")
+            CFGBuilder.save_cfg(cfg, cfg_path)
+            
+            # Save Description
+            desc_path = os.path.join(output_dir, "description", f"{safe_func_name}.json")
+            DescriptionBuilder.save_description(desc, desc_path)
+            
+            # Save Mermaid
+            mermaid_path = os.path.join(output_dir, "diagrams", f"{safe_func_name}.mermaid")
+            with open(mermaid_path, 'w') as f:
+                f.write(mermaid + "\n")
+            
+            print(f"    [OK] Saved artifacts for {func_name}")
+        
+        registry.add_function(func_info)
     
-    if is_valid:
-        print("  [OK] Diagram validation PASSED")
-    else:
-        print(f"  [ERROR] Diagram validation FAILED after {validation_attempts} attempts")
-        print("  Aborting due to persistent validation failures.")
-        sys.exit(1)
+    # Step 5: Build global CallGraph
+    print(f"\nStep 5: Building global CallGraph...")
     
-    # Step 10: Output
-    print("\n" + "=" * 50)
-    print("=== FINAL MERMAID DIAGRAM ===")
-    print("=" * 50 + "\n")
-    print(mermaid)
+    # Aggregate all calls from all CFGs
+    for cfg in all_cfgs:
+        if cfg.function not in global_callgraph.calls:
+            global_callgraph.calls[cfg.function] = []
+        for node in cfg.nodes:
+            if node.type == "call" and node.callee:
+                if node.callee not in global_callgraph.calls[cfg.function]:
+                    global_callgraph.calls[cfg.function].append(node.callee)
     
-    # Save outputs if not dry run
+    print(f"  [OK] Global CallGraph built with {len(global_callgraph.calls)} function(s)")
+    
+    # Step 6: Validate global CallGraph
+    print("\nStep 6: Validating global CallGraph...")
+    cg_validator = CallGraphValidationAgent()
+    all_valid = True
+    for cfg in all_cfgs:
+        is_valid, issues = cg_validator.validate(global_callgraph, cfg)
+        if not is_valid:
+            print(f"  [WARNING] CallGraph validation issues for {cfg.function}:")
+            for issue in issues:
+                print(f"    - {issue}")
+            all_valid = False
+    
+    if all_valid:
+        print("  [OK] Global CallGraph validation PASSED")
+    
+    # Save global CallGraph
     if not dry_run:
-        output_files = {
-            "cfg.json": os.path.join(source_dir, "cfg.json"),
-            "callgraph.json": os.path.join(source_dir, "callgraph.json"),
-            "description.json": os.path.join(source_dir, "description.json"),
-            "output.mermaid": os.path.join(source_dir, "output.mermaid")
-        }
-        
-        # Save mermaid
-        with open(output_files["output.mermaid"], 'w') as f:
-            f.write(mermaid + "\n")
-        
-        print("\n=== GENERATED FILES ===")
-        for name, path in output_files.items():
-            print(f"  {name}: {path}")
+        cg_output = os.path.join(output_dir, "callgraph.json")
+        CallGraphBuilder.save_callgraph(global_callgraph, cg_output)
+        print(f"  [OK] Saved global CallGraph to: {cg_output}")
     
-    # Short explanation
-    print("\n=== EXPLANATION ===")
-    print(f"Function: {cfg.function}")
-    print(f"Summary: {desc.summary}")
-    print(f"Flow: {len(cfg.nodes)} nodes, {len(cfg.edges)} edges")
-    if desc.notes:
-        print(f"Notes: {desc.notes}")
+    # Step 7: Summary
+    print("\n" + "=" * 60)
+    print("=== PROCESSING COMPLETE ===")
+    print("=" * 60)
+    print(f"\nProcessed {len(all_functions)} function(s):")
+    for func_info in all_functions:
+        if func_info.cfg:
+            print(f"  - {func_info.name}: {len(func_info.cfg.nodes)} nodes, {len(func_info.cfg.edges)} edges")
+    
+    if not dry_run:
+        print(f"\n=== OUTPUT STRUCTURE ===")
+        print(f"output/")
+        print(f" ├── cfg/ ({len(all_functions)} files)")
+        print(f" ├── description/ ({len(all_functions)} files)")
+        print(f" ├── diagrams/ ({len(all_functions)} files)")
+        print(f" └── callgraph.json")
+        print(f"\nAll artifacts saved to: {output_dir}")
 
 
 def load_from_json(cfg_file: str, desc_file: str, callgraph_file: Optional[str] = None):
