@@ -31,12 +31,12 @@ from enum import Enum
 
 # Clang integration
 try:
-    from clang.cindex import Index, TranslationUnit, Cursor, CursorKind, SourceLocation
+    from clang.cindex import Index, TranslationUnit, Cursor, CursorKind, SourceLocation, Config
     CLANG_AVAILABLE = True
 except ImportError:
     CLANG_AVAILABLE = False
+    Config = None
     print("[ERROR] clang.cindex not available. Install with: pip install clang")
-    print("  Or install libclang and set LIBCLANG_LIBRARY_PATH environment variable.")
 
 
 # ============================================================================
@@ -198,17 +198,77 @@ def parse_description(desc_json: dict) -> Description:
 class ClangIntegration:
     """Clang integration for AST traversal and CFG extraction"""
     
+    # Clang library paths to try (in order)
+    CLANG_PATHS = [
+        "/usr/lib/llvm-18/lib/libclang.so",  # User's specified path (highest priority)
+        "/usr/lib/llvm-18/lib/libclang.so.18",
+        "/usr/lib/llvm-17/lib/libclang.so",
+        "/usr/lib/llvm-17/lib/libclang.so.17",
+        "/usr/lib/llvm-16/lib/libclang.so",
+        "/usr/lib/llvm-16/lib/libclang.so.16",
+        "/usr/lib/llvm-15/lib/libclang.so",
+        "/usr/lib/llvm-15/lib/libclang.so.15",
+        "/usr/lib/x86_64-linux-gnu/libclang.so.1",
+        "/usr/local/lib/libclang.so",
+    ]
+    
+    _clang_initialized = False
+    
+    @staticmethod
+    def _initialize_clang() -> bool:
+        """Initialize Clang with library path detection"""
+        if ClangIntegration._clang_initialized:
+            return True
+        
+        if not CLANG_AVAILABLE:
+            return False
+        
+        # Try to set Clang library path
+        clang_found = False
+        for path in ClangIntegration.CLANG_PATHS:
+            if os.path.exists(path):
+                try:
+                    if Config:
+                        Config.set_library_file(path)
+                    print(f"[INFO] Using Clang library: {path}")
+                    clang_found = True
+                    break
+                except Exception as e:
+                    # Try next path
+                    continue
+        
+        if not clang_found:
+            # Try environment variable
+            env_path = os.environ.get('LIBCLANG_LIBRARY_PATH')
+            if env_path and os.path.exists(env_path):
+                try:
+                    if Config:
+                        Config.set_library_file(env_path)
+                    print(f"[INFO] Using Clang library from environment: {env_path}")
+                    clang_found = True
+                except Exception:
+                    pass
+        
+        # Test if Clang works
+        try:
+            Index.create()
+            ClangIntegration._clang_initialized = True
+            return True
+        except Exception as e:
+            if not clang_found:
+                print(f"[ERROR] Clang initialization failed: {e}")
+                print(f"[ERROR] Tried paths:")
+                for path in ClangIntegration.CLANG_PATHS[:5]:
+                    exists = "✓" if os.path.exists(path) else "✗"
+                    print(f"  {exists} {path}")
+                print(f"\n[ERROR] Please ensure Clang is installed and library is accessible.")
+                print(f"  Or set LIBCLANG_LIBRARY_PATH environment variable.")
+            return False
+    
     @staticmethod
     def check_clang_available() -> bool:
         """Check if Clang is available"""
-        if not CLANG_AVAILABLE:
-            return False
-        try:
-            Index.create()
-            return True
-        except Exception as e:
-            print(f"[ERROR] Clang initialization failed: {e}")
-            return False
+        return ClangIntegration._initialize_clang()
     
     @staticmethod
     def discover_all_functions(source_dir: str) -> List[FunctionInfo]:
@@ -219,10 +279,12 @@ class ClangIntegration:
         """
         if not ClangIntegration.check_clang_available():
             raise RuntimeError(
-                "Clang is not available. Please install:\n"
-                "  1. Install libclang (system package manager)\n"
-                "  2. pip install clang\n"
-                "  3. Set LIBCLANG_LIBRARY_PATH if needed\n"
+                "Clang is not available. Please ensure:\n"
+                "  1. libclang is installed (e.g., libclang-dev or llvm packages)\n"
+                "  2. Python clang package is installed: pip install clang\n"
+                "  3. Clang library exists at one of the expected paths\n"
+                f"     (Checked: {', '.join(ClangIntegration.CLANG_PATHS[:3])})\n"
+                "  4. Or set LIBCLANG_LIBRARY_PATH environment variable\n"
                 "DO NOT continue without Clang - this is required."
             )
         
