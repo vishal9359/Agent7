@@ -1,0 +1,36 @@
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+!CMakeLists.txt
+
+# Compiled binaries
+agent7
+agent7.exe
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Output files
+output.mermaid
+*.mermaid
+
+# Test files (if any)
+test_*.json
+

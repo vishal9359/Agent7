@@ -1,0 +1,15 @@
+{
+  "function": "Replicate",
+  "nodes": [
+    { "id": 1, "type": "entry" },
+    { "id": 2, "type": "condition", "expr": "x > 0" },
+    { "id": 3, "type": "call", "callee": "sendData" },
+    { "id": 4, "type": "return" }
+  ],
+  "edges": [
+    { "from": 1, "to": 2 },
+    { "from": 2, "to": 3, "label": "true" },
+    { "from": 2, "to": 4, "label": "false" }
+  ]
+}
+

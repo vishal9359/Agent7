@@ -1,0 +1,7 @@
+{
+  "Replicate": {
+    "summary": "Handles replication logic when condition is met",
+    "notes": "Uses sendData when x > 0"
+  }
+}
+
