@@ -760,7 +760,8 @@ class ClangIntegration:
         if not args:
             raise RuntimeError(
                 f"[ERROR] Cannot find compile arguments for {source_file}\n"
-                f"  compile_commands.json is REQUIRED for CFG extraction"
+                f"  This file is not listed in compile_commands.json\n"
+                f"  Ensure compile_commands.json contains an entry for this file"
             )
         
         # Remove output flags and ensure proper parsing
@@ -1942,21 +1943,48 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
                 break
             current_dir = parent
     
-    if not os.path.exists(compile_commands_path):
-        error_msg = (
-            f"[ERROR] compile_commands.json is REQUIRED but not found.\n"
-            f"  Searched in:\n"
-        )
-        for path in checked_paths[:5]:
-            error_msg += f"    - {path}\n"
-        error_msg += (
-            f"\n  Please generate compile_commands.json:\n"
-            f"    - cmake: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .\n"
-            f"    - bear: bear -- make\n"
-            f"    - clang: clang -p .\n"
-        )
-        print(error_msg)
-        sys.exit(1)
+        if not os.path.exists(compile_commands_path):
+            error_msg = (
+                f"\n[ERROR] compile_commands.json is REQUIRED but not found.\n"
+                f"\n"
+                f"WHY IS IT NEEDED?\n"
+                f"  Clang (the C++ parser) needs compile_commands.json to know:\n"
+                f"    - Include paths (where to find header files)\n"
+                f"    - Compiler flags (-std=c++17, -D defines, etc.)\n"
+                f"    - Preprocessor macros\n"
+                f"    - System library paths\n"
+                f"\n"
+                f"  Without it, Clang cannot properly parse C++ code with includes,\n"
+                f"  macros, or complex build configurations.\n"
+                f"\n"
+                f"SEARCHED IN:\n"
+            )
+            for path in checked_paths[:5]:
+                error_msg += f"    - {path}\n"
+            error_msg += (
+                f"\n"
+                f"HOW TO GENERATE compile_commands.json:\n"
+                f"\n"
+                f"  Option 1 (CMake projects):\n"
+                f"    cd <project_root>\n"
+                f"    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .\n"
+                f"    # or if build directory:\n"
+                f"    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON <build_dir>\n"
+                f"\n"
+                f"  Option 2 (Make projects):\n"
+                f"    cd <project_root>\n"
+                f"    bear -- make\n"
+                f"    # or: bear -- make -j8\n"
+                f"\n"
+                f"  Option 3 (Custom build):\n"
+                f"    Install 'bear' or 'compiledb'\n"
+                f"    Run: bear -- <your_build_command>\n"
+                f"\n"
+                f"  The compile_commands.json should be in the project root directory.\n"
+                f"\n"
+            )
+            print(error_msg)
+            sys.exit(1)
     
     # Load compile_commands.json
     compile_commands = None
