@@ -288,12 +288,17 @@ class ClangIntegration:
         if cursor.kind not in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD]:
             return False
         
-        # Must be a definition, not just declaration
-        if not cursor.is_definition():
+        # Must be a definition, not just declaration (check if method exists)
+        if hasattr(cursor, 'is_definition'):
+            if not cursor.is_definition():
+                return False
+        else:
+            # If is_definition() doesn't exist, skip (likely just a declaration)
+            # We can't tell if it's a definition, so err on the side of caution
             return False
         
-        # Must not be implicit (compiler-generated)
-        if cursor.is_implicit():
+        # Must not be implicit (compiler-generated) - check if method exists
+        if hasattr(cursor, 'is_implicit') and cursor.is_implicit():
             return False
         
         # Get function name
@@ -330,9 +335,14 @@ class ClangIntegration:
         if not file_path:
             return False
         
-        # Normalize paths for comparison
-        file_path_abs = os.path.abspath(file_path)
-        project_root_abs = os.path.abspath(project_root)
+        # Normalize paths for comparison (handle Windows paths)
+        file_path_abs = os.path.normpath(os.path.abspath(file_path))
+        project_root_abs = os.path.normpath(os.path.abspath(project_root))
+        
+        # Convert to lowercase for comparison on Windows (case-insensitive filesystem)
+        if os.name == 'nt':  # Windows
+            file_path_abs = file_path_abs.lower()
+            project_root_abs = project_root_abs.lower()
         
         # File must be inside project root
         if not file_path_abs.startswith(project_root_abs):
@@ -340,11 +350,13 @@ class ClangIntegration:
         
         # Check if it's a system header (additional safety check)
         # System headers typically have paths like /usr/include, /usr/lib, etc.
+        # On Windows, check for system paths too
         system_paths = ['/usr/include', '/usr/lib', '/usr/local/include', 
-                       '/usr/local/lib', '/opt', '/usr/share']
-        file_path_lower = file_path.lower()
+                       '/usr/local/lib', '/opt', '/usr/share',
+                       '\\windows\\', '\\program files\\', 'c:\\windows']
+        file_path_lower = file_path_abs.lower()
         for sys_path in system_paths:
-            if sys_path in file_path_abs:
+            if sys_path.lower() in file_path_lower:
                 return False
         
         return True
@@ -369,8 +381,8 @@ class ClangIntegration:
                 "DO NOT continue without Clang - this is required."
             )
         
-        # Normalize project root path
-        project_root = os.path.abspath(source_dir)
+        # Normalize project root path (handle Windows paths)
+        project_root = os.path.normpath(os.path.abspath(source_dir))
         
         functions = []
         index = Index.create()
@@ -385,8 +397,15 @@ class ClangIntegration:
             pattern_recursive = os.path.join(project_root, '**', ext)
             cpp_files.extend(glob.glob(pattern_recursive, recursive=True))
         
-        # Filter to only files actually in project root
-        cpp_files = [f for f in cpp_files if os.path.abspath(f).startswith(project_root)]
+        # Filter to only files actually in project root (normalize for comparison)
+        normalized_project = project_root.lower() if os.name == 'nt' else project_root
+        filtered_files = []
+        for f in cpp_files:
+            f_abs = os.path.normpath(os.path.abspath(f))
+            f_normalized = f_abs.lower() if os.name == 'nt' else f_abs
+            if f_normalized.startswith(normalized_project):
+                filtered_files.append(f)
+        cpp_files = filtered_files
         
         if not cpp_files:
             print(f"[WARNING] No C++ files found in {source_dir}")
@@ -413,61 +432,115 @@ class ClangIntegration:
         
         rejected_count = 0
         system_functions = []
+        parse_errors = []
         
         for cpp_file in cpp_files[:50]:  # Limit to 50 files for performance
             try:
-                # Parse translation unit - include function bodies, skip system headers where possible
-                parse_options = TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD | TranslationUnit.PARSE_INCOMPLETE
+                # Parse translation unit - include function bodies
+                # Use basic parsing options that work across Clang versions
+                try:
+                    parse_options = TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+                except AttributeError:
+                    # Fallback if PARSE_DETAILED_PROCESSING_RECORD doesn't exist
+                    parse_options = 0
+                
                 tu = index.parse(cpp_file, args=args, options=parse_options)
                 
-                    # Walk AST to find function definitions
+                # Walk AST to find function definitions
                 def visit_node(cursor: Cursor):
                     nonlocal rejected_count
                     
-                    # Skip system headers early
-                    if cursor.location and cursor.location.file:
-                        file_path = cursor.location.file.name
-                        if file_path and not os.path.abspath(file_path).startswith(project_root):
-                            # Skip entire subtrees from system headers
-                            return
-                    
-                    # Check if it's a user-defined function (FUNCTION_DECL or CXX_METHOD)
-                    if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD]:
-                        if ClangIntegration._is_user_defined_function(cursor, project_root):
-                            func_name = cursor.spelling
-                            
-                            # Get file location for verification
-                            location = cursor.location
-                            file_path = location.file.name if location and location.file else ""
-                            
-                            # Get full qualified name
-                            full_name = ClangIntegration._get_qualified_name(cursor)
-                            
-                            func_info = FunctionInfo(
-                                name=func_name,
-                                source_file=os.path.basename(file_path) if file_path else os.path.basename(cpp_file),
-                                full_name=full_name
-                            )
-                            functions.append(func_info)
-                        else:
-                            # Track rejected functions for validation
-                            func_name = cursor.spelling
-                            if func_name:
+                    try:
+                        # Skip system headers early (normalize paths for comparison)
+                        if cursor.location and cursor.location.file:
+                            file_path = cursor.location.file.name
+                            if file_path:
+                                file_path_abs = os.path.normpath(os.path.abspath(file_path))
+                                project_root_normalized = project_root.lower() if os.name == 'nt' else project_root
+                                file_path_normalized = file_path_abs.lower() if os.name == 'nt' else file_path_abs
+                                if not file_path_normalized.startswith(project_root_normalized):
+                                    # Skip entire subtrees from system headers
+                                    return
+                        
+                        # Check if it's a user-defined function (FUNCTION_DECL or CXX_METHOD)
+                        if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD]:
+                            if ClangIntegration._is_user_defined_function(cursor, project_root):
+                                func_name = cursor.spelling
+                                
+                                # Get file location for verification
                                 location = cursor.location
-                                if location and location.file:
-                                    file_path = location.file.name
-                                    if file_path and not os.path.abspath(file_path).startswith(project_root):
-                                        system_functions.append(func_name)
-                                        rejected_count += 1
-                    
-                    # Recurse into children
-                    for child in cursor.get_children():
-                        visit_node(child)
+                                file_path = location.file.name if location and location.file else ""
+                                
+                                # Get full qualified name
+                                full_name = ClangIntegration._get_qualified_name(cursor)
+                                
+                                func_info = FunctionInfo(
+                                    name=func_name,
+                                    source_file=os.path.basename(file_path) if file_path else os.path.basename(cpp_file),
+                                    full_name=full_name
+                                )
+                                functions.append(func_info)
+                            else:
+                                # Track rejected functions for validation
+                                func_name = cursor.spelling
+                                if func_name:
+                                    try:
+                                        location = cursor.location
+                                        if location and location.file:
+                                            file_path = location.file.name
+                                            if file_path:
+                                                file_path_abs = os.path.normpath(os.path.abspath(file_path))
+                                                project_root_normalized = project_root.lower() if os.name == 'nt' else project_root
+                                                file_path_normalized = file_path_abs.lower() if os.name == 'nt' else file_path_abs
+                                                if not file_path_normalized.startswith(project_root_normalized):
+                                                    system_functions.append(func_name)
+                                                    rejected_count += 1
+                                    except (AttributeError, TypeError):
+                                        pass
+                        
+                        # Recurse into children (always attempt even if parent had issues)
+                        try:
+                            for child in cursor.get_children():
+                                visit_node(child)
+                        except (AttributeError, TypeError):
+                            pass
+                    except (AttributeError, TypeError) as attr_err:
+                        # Skip nodes that cause attribute errors (version compatibility)
+                        # But try to continue processing children
+                        try:
+                            for child in cursor.get_children():
+                                visit_node(child)
+                        except:
+                            pass
+                    except Exception as node_err:
+                        # Log but don't stop processing - try to continue with children
+                        try:
+                            for child in cursor.get_children():
+                                visit_node(child)
+                        except:
+                            pass
                 
-                visit_node(tu.cursor)
+                # Call visit_node with outer error handling
+                try:
+                    visit_node(tu.cursor)
+                except Exception as visit_err:
+                    # If visit_node itself fails completely, log but continue
+                    error_msg = str(visit_err)
+                    if 'is_implicit' not in error_msg and 'object has no attribute' not in error_msg:
+                        parse_errors.append((cpp_file, str(visit_err)))
+                    continue
                 
             except Exception as e:
-                print(f"  [WARNING] Failed to parse {cpp_file}: {e}")
+                error_msg = str(e)
+                # Store error for later reporting
+                parse_errors.append((cpp_file, error_msg))
+                # Only warn about critical errors (attribute errors are handled above)
+                if 'is_implicit' in error_msg or 'object has no attribute' in error_msg:
+                    # These are version compatibility issues - silently continue
+                    pass
+                else:
+                    print(f"  [WARNING] Failed to parse {cpp_file}: {e}")
+                # Continue processing other files
                 continue
         
         # Validation: Check for too many system functions
@@ -485,18 +558,54 @@ class ClangIntegration:
             # Remove them
             functions = [f for f in functions if not f.name.startswith("operator")]
         
+        # Report parse errors if any
+        if parse_errors:
+            unique_errors = {}
+            for file, error in parse_errors:
+                if error not in unique_errors:
+                    unique_errors[error] = []
+                unique_errors[error].append(os.path.basename(file))
+            
+            for error, files in unique_errors.items():
+                if 'is_implicit' in error or 'object has no attribute' in error:
+                    print(f"  [INFO] Skipped {len(files)} file(s) due to Clang version compatibility")
+                    if len(files) <= 3:
+                        print(f"    Files: {', '.join(files)}")
+                else:
+                    print(f"  [WARNING] Parse errors in {len(files)} file(s): {error[:100]}")
+        
         # Final validation
         if len(functions) == 0:
             print(f"  [ERROR] No user-defined functions found in project path")
-            print(f"  [ERROR] This may indicate a filtering issue or empty project")
+            print(f"  [ERROR] Project root: {project_root}")
+            print(f"  [ERROR] Files searched: {len(cpp_files)}")
+            if cpp_files:
+                print(f"  [ERROR] Example files: {[os.path.basename(f) for f in cpp_files[:5]]}")
+            print(f"  [ERROR] This may indicate:")
+            print(f"    - Filtering too strict")
+            print(f"    - Path mismatch (check if files are actually in project root)")
+            print(f"    - Clang parsing failures")
             raise RuntimeError("No valid user-defined functions found")
         
         if len(functions) == 1:
             print(f"  [WARNING] Only one function detected - this may indicate a problem")
         
-        print(f"  [OK] Discovered {len(functions)} user-defined function(s)")
-        if rejected_count > 0:
-            print(f"  [INFO] Filtered out {rejected_count} system/STL/compiler functions")
+        if len(functions) > 0:
+            print(f"  [OK] Discovered {len(functions)} user-defined function(s)")
+            if rejected_count > 0:
+                print(f"  [INFO] Filtered out {rejected_count} system/STL/compiler functions")
+            
+            # Show some example functions found
+            example_funcs = [f.name for f in functions[:5]]
+            print(f"  [INFO] Example functions: {', '.join(example_funcs)}")
+        else:
+            print(f"  [WARNING] No functions discovered yet")
+            if cpp_files:
+                print(f"  [INFO] Searched {len(cpp_files)} file(s), but no valid functions found")
+                print(f"  [INFO] This may indicate:")
+                print(f"    - All functions are filtered out (check filtering logic)")
+                print(f"    - Clang parsing issues (check errors above)")
+                print(f"    - Files don't contain function definitions")
         
         return functions
     
