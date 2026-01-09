@@ -362,7 +362,7 @@ class ClangIntegration:
         return True
     
     @staticmethod
-    def discover_all_functions(source_dir: str) -> List[FunctionInfo]:
+    def discover_all_functions(source_dir: str, compile_args_map: Dict[str, List[str]] = None) -> List[FunctionInfo]:
         """
         Discover all user-defined function definitions using Clang AST.
         
@@ -411,21 +411,67 @@ class ClangIntegration:
             print(f"[WARNING] No C++ files found in {source_dir}")
             return functions
         
-        # Try to find compile_commands.json
-        args = ['-std=c++17', '-x', 'c++']
+        # REQUIRE compile_commands.json
         compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
         if not os.path.exists(compile_commands_path):
-            # Check parent directories
-            parent = os.path.dirname(source_dir)
-            compile_commands_path = os.path.join(parent, 'compile_commands.json')
+            # Check parent directories (up to 3 levels)
+            checked_paths = [compile_commands_path]
+            current_dir = source_dir
+            for _ in range(3):
+                parent = os.path.dirname(current_dir)
+                if parent == current_dir:
+                    break
+                compile_commands_path = os.path.join(parent, 'compile_commands.json')
+                checked_paths.append(compile_commands_path)
+                if os.path.exists(compile_commands_path):
+                    break
+                current_dir = parent
         
-        if os.path.exists(compile_commands_path):
-            try:
-                with open(compile_commands_path, 'r') as f:
-                    compile_commands = json.load(f)
-                print(f"  [OK] Found compile_commands.json")
-            except Exception as e:
-                print(f"  [WARNING] Could not parse compile_commands.json: {e}")
+        if not os.path.exists(compile_commands_path):
+            error_msg = (
+                f"[ERROR] compile_commands.json is REQUIRED but not found.\n"
+                f"  Searched in:\n"
+            )
+            for path in checked_paths[:5]:
+                error_msg += f"    - {path}\n"
+            error_msg += (
+                f"\n  Please generate compile_commands.json:\n"
+                f"    - cmake: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .\n"
+                f"    - bear: bear make\n"
+                f"    - clang-tidy: clang-tidy -p .\n"
+            )
+            raise RuntimeError(error_msg)
+        
+        # Load compile_commands.json
+        compile_commands = None
+        try:
+            with open(compile_commands_path, 'r') as f:
+                compile_commands = json.load(f)
+            print(f"  [OK] Found and loaded compile_commands.json: {compile_commands_path}")
+        except Exception as e:
+            raise RuntimeError(
+                f"[ERROR] Failed to parse compile_commands.json: {e}\n"
+                f"  Path: {compile_commands_path}\n"
+                f"  Please fix or regenerate compile_commands.json"
+            )
+        
+        if not compile_commands or not isinstance(compile_commands, list):
+            raise RuntimeError(
+                f"[ERROR] compile_commands.json is invalid or empty\n"
+                f"  Expected: array of compile command objects"
+            )
+        
+        # Build file -> compile args mapping
+        compile_args_map = {}
+        for entry in compile_commands:
+            file_path = entry.get('file', '')
+            if file_path:
+                # Normalize path
+                abs_file = os.path.abspath(file_path)
+                compile_args_map[abs_file] = entry.get('arguments', entry.get('command', '').split())
+                # Also map by basename
+                basename = os.path.basename(file_path)
+                compile_args_map[basename] = entry.get('arguments', entry.get('command', '').split())
         
         print(f"  [INFO] Parsing {len(cpp_files)} C++ file(s) with Clang...")
         print(f"  [INFO] Project root: {project_root}")
@@ -436,15 +482,53 @@ class ClangIntegration:
         
         for cpp_file in cpp_files[:50]:  # Limit to 50 files for performance
             try:
-                # Parse translation unit - include function bodies
-                # Use basic parsing options that work across Clang versions
-                try:
-                    parse_options = TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
-                except AttributeError:
-                    # Fallback if PARSE_DETAILED_PROCESSING_RECORD doesn't exist
-                    parse_options = 0
+                # Get compile arguments for this file
+                cpp_file_abs = os.path.abspath(cpp_file)
+                file_args = None
+                if compile_args_map:
+                    file_args = compile_args_map.get(cpp_file_abs) or compile_args_map.get(os.path.basename(cpp_file))
                 
-                tu = index.parse(cpp_file, args=args, options=parse_options)
+                if file_args:
+                    # Use compile arguments from compile_commands.json
+                    # Remove compiler name (first arg) and file path (last arg typically)
+                    parse_args = [arg for arg in file_args if arg not in ['-o', '-c'] and not arg.endswith('.o')]
+                    # Ensure -x c++ is present
+                    if '-x' not in parse_args:
+                        parse_args.extend(['-x', 'c++'])
+                else:
+                    # Fallback: basic args (should not happen with proper compile_commands.json)
+                    print(f"  [WARNING] No compile args found for {os.path.basename(cpp_file)}, using defaults")
+                    parse_args = ['-std=c++17', '-x', 'c++']
+                
+                # Parse translation unit with proper options
+                parse_options = 0
+                try:
+                    parse_options |= TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+                except AttributeError:
+                    pass
+                
+                try:
+                    parse_options |= TranslationUnit.PARSE_INCOMPLETE
+                except AttributeError:
+                    pass
+                
+                # Parse with compile arguments from compile_commands.json
+                tu = index.parse(cpp_file, args=parse_args, options=parse_options)
+                
+                # Check for Clang diagnostics (errors/warnings)
+                diags = list(tu.diagnostics)
+                if diags:
+                    errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
+                    if errors:
+                        error_msgs = []
+                        for diag in errors[:5]:  # Limit to first 5 errors
+                            error_msgs.append(f"    {diag.spelling} (line {diag.location.line})")
+                        if len(errors) > 5:
+                            error_msgs.append(f"    ... and {len(errors) - 5} more errors")
+                        print(f"  [ERROR] Clang parsing errors in {os.path.basename(cpp_file)}:")
+                        for msg in error_msgs:
+                            print(msg)
+                        # Continue but note that parsing may be incomplete
                 
                 # Walk AST to find function definitions
                 def visit_node(cursor: Cursor):
@@ -462,8 +546,9 @@ class ClangIntegration:
                                     # Skip entire subtrees from system headers
                                     return
                         
-                        # Check if it's a user-defined function (FUNCTION_DECL or CXX_METHOD)
-                        if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD]:
+                        # Check if it's a user-defined function (support multiple kinds)
+                        if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD,
+                                          CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR]:
                             if ClangIntegration._is_user_defined_function(cursor, project_root):
                                 func_name = cursor.spelling
                                 
@@ -627,48 +712,132 @@ class ClangIntegration:
         return '::'.join(filter(None, parts))
     
     @staticmethod
-    def build_cfg_from_clang(source_file: str, function_name: str) -> Optional[CFG]:
+    def build_cfg_from_clang(source_file: str, function_name: str, compile_args_map: Dict[str, List[str]] = None) -> Optional[CFG]:
         """
-        Build CFG for a specific function using Clang's CFG.
+        Build CFG for a specific function using Clang's AST.
         
-        Note: Clang's CFG API is complex. This is a simplified implementation
-        that extracts basic control flow. For production, use full Clang CFG API.
+        REQUIRES compile_commands.json for proper parsing.
+        NO FALLBACK - fails clearly if CFG cannot be extracted.
         """
         if not ClangIntegration.check_clang_available():
-            return None
+            raise RuntimeError("Clang is not available - cannot build CFG")
         
         index = Index.create()
-        args = ['-std=c++17', '-x', 'c++']
+        
+        # Get compile arguments from compile_commands.json
+        source_file_abs = os.path.abspath(source_file)
+        args = None
+        
+        if compile_args_map:
+            args = compile_args_map.get(source_file_abs) or compile_args_map.get(os.path.basename(source_file))
+        
+        if not args:
+            # Try to find compile_commands.json
+            source_dir = os.path.dirname(source_file_abs)
+            compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
+            if not os.path.exists(compile_commands_path):
+                # Check parent directories
+                for _ in range(3):
+                    parent = os.path.dirname(source_dir)
+                    if parent == source_dir:
+                        break
+                    compile_commands_path = os.path.join(parent, 'compile_commands.json')
+                    if os.path.exists(compile_commands_path):
+                        break
+                    source_dir = parent
+            
+            if os.path.exists(compile_commands_path):
+                try:
+                    with open(compile_commands_path, 'r') as f:
+                        compile_commands = json.load(f)
+                    for entry in compile_commands:
+                        if entry.get('file') == source_file_abs or os.path.basename(entry.get('file', '')) == os.path.basename(source_file):
+                            args = entry.get('arguments', entry.get('command', '').split())
+                            break
+                except Exception:
+                    pass
+        
+        if not args:
+            raise RuntimeError(
+                f"[ERROR] Cannot find compile arguments for {source_file}\n"
+                f"  compile_commands.json is REQUIRED for CFG extraction"
+            )
+        
+        # Remove output flags and ensure proper parsing
+        parse_args = [arg for arg in args if arg not in ['-o', '-c'] and not arg.endswith('.o')]
+        if '-x' not in parse_args:
+            parse_args.extend(['-x', 'c++'])
+        
+        # Parse with proper options
+        parse_options = 0
+        try:
+            parse_options |= TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+        except AttributeError:
+            pass
         
         try:
-            tu = index.parse(source_file, args=args)
-            target_func = None
+            tu = index.parse(source_file, args=parse_args, options=parse_options)
+        except Exception as e:
+            raise RuntimeError(
+                f"[ERROR] Failed to parse translation unit for {source_file}: {e}\n"
+                f"  This indicates Clang cannot parse the file correctly"
+            )
+        
+        # Check diagnostics
+        diags = list(tu.diagnostics)
+        errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
+        if errors:
+            error_msgs = [f"    {d.spelling} (line {d.location.line})" for d in errors[:5]]
+            raise RuntimeError(
+                f"[ERROR] Clang parsing errors in {source_file}:\n" +
+                "\n".join(error_msgs) +
+                f"\n  Cannot extract CFG with parsing errors"
+            )
+        
+        target_func = None
+        
+        # Find the function (support multiple cursor kinds)
+        def find_function(cursor: Cursor):
+            nonlocal target_func
+            if target_func:
+                return
             
-            # Find the function
-            def find_function(cursor: Cursor):
-                nonlocal target_func
-                if cursor.kind == CursorKind.FUNCTION_DECL and cursor.is_definition():
+            if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD, 
+                              CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR]:
+                if hasattr(cursor, 'is_definition') and cursor.is_definition():
                     if cursor.spelling == function_name:
                         target_func = cursor
                         return
-                for child in cursor.get_children():
-                    find_function(child)
             
-            find_function(tu.cursor)
-            
-            if not target_func:
-                return None
-            
-            # Extract CFG (simplified - using AST traversal)
-            return ClangIntegration._extract_cfg_from_cursor(target_func, function_name)
-            
+            for child in cursor.get_children():
+                find_function(child)
+        
+        find_function(tu.cursor)
+        
+        if not target_func:
+            raise RuntimeError(
+                f"[ERROR] Function '{function_name}' not found in {source_file}\n"
+                f"  Function may not exist or may be filtered out"
+            )
+        
+        # Extract CFG using AST traversal
+        try:
+            cfg = ClangIntegration._extract_cfg_from_cursor(target_func, function_name)
+            if not cfg or len(cfg.nodes) < 2:
+                raise RuntimeError(
+                    f"[ERROR] CFG extraction produced invalid result for {function_name}\n"
+                    f"  Nodes: {len(cfg.nodes) if cfg else 0}, Expected: >= 2"
+                )
+            return cfg
         except Exception as e:
-            print(f"  [ERROR] Clang CFG extraction failed: {e}")
-            return None
+            raise RuntimeError(
+                f"[ERROR] CFG extraction failed for {function_name}: {e}\n"
+                f"  Cannot generate CFG from AST"
+            )
     
     @staticmethod
     def _extract_cfg_from_cursor(cursor: Cursor, function_name: str) -> CFG:
-        """Extract CFG from Clang cursor (simplified implementation)"""
+        """Extract CFG from Clang cursor using AST traversal"""
         cfg = CFG(function=function_name)
         node_id = 1
         
@@ -680,6 +849,7 @@ class ClangIntegration:
         
         # Walk the function body to extract control flow
         prev_node_id = entry_id
+        node_stack = []  # Stack for handling nested structures
         
         def process_statement(stmt_cursor: Cursor, prev_id: int) -> int:
             nonlocal node_id
@@ -687,12 +857,18 @@ class ClangIntegration:
             if stmt_cursor.kind == CursorKind.IF_STMT:
                 # Extract condition
                 cond_text = ""
-                for child in stmt_cursor.get_children():
-                    if child.kind == CursorKind.BINARY_OPERATOR or child.kind == CursorKind.UNEXPOSED_EXPR:
-                        # Try to get condition text
-                        tokens = [token.spelling for token in child.get_tokens()]
-                        cond_text = ' '.join(tokens)
-                        break
+                children_list = list(stmt_cursor.get_children())
+                
+                # First child is typically the condition
+                if children_list:
+                    cond_cursor = children_list[0]
+                    try:
+                        tokens = [token.spelling for token in cond_cursor.get_tokens()]
+                        cond_text = ' '.join(tokens[:20])  # Limit length
+                        if not cond_text.strip():
+                            cond_text = "condition"
+                    except:
+                        cond_text = "condition"
                 
                 if not cond_text:
                     cond_text = "condition"
@@ -704,29 +880,46 @@ class ClangIntegration:
                 cond_id = node_id
                 node_id += 1
                 
-                # Process then branch
+                # Process then branch (second child typically)
                 then_id = node_id
-                node_id += 1
                 then_node = CFGNode(id=then_id, type="statement")
                 cfg.nodes.append(then_node)
                 cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
+                node_id += 1
                 
-                # Process else branch if exists
-                has_else = False
-                children = list(stmt_cursor.get_children())
-                if len(children) >= 3:
+                # Process else branch if exists (third child)
+                has_else = len(children_list) >= 3
+                if has_else:
                     else_id = node_id
-                    node_id += 1
                     else_node = CFGNode(id=else_id, type="statement")
                     cfg.nodes.append(else_node)
                     cfg.edges.append(CFGEdge(from_node=cond_id, to_node=else_id, label="false"))
-                    has_else = True
-                
-                return then_id if has_else else cond_id
+                    node_id += 1
+                    return else_id  # Return else node as continuation
+                else:
+                    return then_id  # Return then node as continuation
                 
             elif stmt_cursor.kind == CursorKind.CALL_EXPR:
-                # Function call
+                # Function call - get the callee name
                 callee = stmt_cursor.spelling or "unknown"
+                # If spelling is empty, try to get from referenced cursor
+                if callee == "unknown":
+                    try:
+                        referenced = stmt_cursor.referenced
+                        if referenced:
+                            callee = referenced.spelling or "unknown"
+                    except:
+                        pass
+                
+                # Filter out operator calls and other system calls
+                if callee.startswith("operator") or callee.startswith("__"):
+                    # Still create node but mark it differently
+                    stmt_node = CFGNode(id=node_id, type="statement")
+                    cfg.nodes.append(stmt_node)
+                    cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
+                    node_id += 1
+                    return node_id - 1
+                
                 call_node = CFGNode(id=node_id, type="call", callee=callee)
                 cfg.nodes.append(call_node)
                 cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
@@ -747,11 +940,38 @@ class ClangIntegration:
             node_id += 1
             return node_id - 1
         
-        # Process function body
+        # Process function body - find compound statement
+        body_found = False
         for child in cursor.get_children():
             if child.kind == CursorKind.COMPOUND_STMT:
-                for stmt in child.get_children():
-                    prev_node_id = process_statement(stmt, prev_node_id)
+                body_found = True
+                # Process statements in the compound statement
+                stmt_list = list(child.get_children())
+                if not stmt_list:
+                    # Empty function body
+                    pass
+                else:
+                    for stmt in stmt_list:
+                        try:
+                            prev_node_id = process_statement(stmt, prev_node_id)
+                        except Exception as e:
+                            # If processing fails, create a statement node and continue
+                            stmt_node = CFGNode(id=node_id, type="statement")
+                            cfg.nodes.append(stmt_node)
+                            cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
+                            prev_node_id = node_id
+                            node_id += 1
+                break
+        
+        # If no compound statement found, function might have inline body
+        if not body_found:
+            # Try to process direct children as statements
+            for child in cursor.get_children():
+                if child.kind != CursorKind.PARM_DECL:  # Skip parameters
+                    try:
+                        prev_node_id = process_statement(child, prev_node_id)
+                    except:
+                        pass
         
         # Ensure return node exists
         has_return = any(n.type == "return" for n in cfg.nodes)
@@ -1706,8 +1926,71 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         print("  3. Set LIBCLANG_LIBRARY_PATH if needed")
         sys.exit(1)
     
+    # Load compile_commands.json first (needed for function discovery and CFG extraction)
+    compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
+    if not os.path.exists(compile_commands_path):
+        # Check parent directories (up to 3 levels)
+        checked_paths = [compile_commands_path]
+        current_dir = source_dir
+        for _ in range(3):
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:
+                break
+            compile_commands_path = os.path.join(parent, 'compile_commands.json')
+            checked_paths.append(compile_commands_path)
+            if os.path.exists(compile_commands_path):
+                break
+            current_dir = parent
+    
+    if not os.path.exists(compile_commands_path):
+        error_msg = (
+            f"[ERROR] compile_commands.json is REQUIRED but not found.\n"
+            f"  Searched in:\n"
+        )
+        for path in checked_paths[:5]:
+            error_msg += f"    - {path}\n"
+        error_msg += (
+            f"\n  Please generate compile_commands.json:\n"
+            f"    - cmake: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .\n"
+            f"    - bear: bear -- make\n"
+            f"    - clang: clang -p .\n"
+        )
+        print(error_msg)
+        sys.exit(1)
+    
+    # Load compile_commands.json
+    compile_commands = None
+    compile_args_map = {}
     try:
-        all_functions = ClangIntegration.discover_all_functions(source_dir)
+        with open(compile_commands_path, 'r') as f:
+            compile_commands = json.load(f)
+        print(f"  [OK] Found compile_commands.json: {compile_commands_path}")
+        
+        # Build file -> compile args mapping
+        for entry in compile_commands:
+            file_path = entry.get('file', '')
+            if file_path:
+                abs_file = os.path.abspath(file_path)
+                args = entry.get('arguments', [])
+                if not args:
+                    # Parse command string if arguments not available
+                    cmd = entry.get('command', '')
+                    if cmd:
+                        import shlex
+                        args = shlex.split(cmd)
+                        # Remove compiler name and output flags
+                        args = [a for a in args[1:] if a not in ['-o', '-c'] and not a.endswith('.o')]
+                compile_args_map[abs_file] = args
+                compile_args_map[os.path.basename(file_path)] = args
+    except Exception as e:
+        raise RuntimeError(
+            f"[ERROR] Failed to load compile_commands.json: {e}\n"
+            f"  Path: {compile_commands_path}\n"
+            f"  Please fix or regenerate compile_commands.json"
+        )
+    
+    try:
+        all_functions = ClangIntegration.discover_all_functions(source_dir, compile_args_map)
     except Exception as e:
         print(f"  [ERROR] Function discovery failed: {e}")
         sys.exit(1)
@@ -1716,8 +1999,9 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         print("  [ERROR] No functions found. Aborting.")
         sys.exit(1)
     
-    if len(all_functions) == 1:
-        print("  [WARNING] Only one function detected. This may indicate a problem.")
+    if len(all_functions) < 5:
+        print(f"  [WARNING] Only {len(all_functions)} function(s) detected. This may indicate a problem.")
+        print(f"  [WARNING] Expected at least 5 functions. Check filtering and Clang parsing.")
     
     print(f"  [OK] Discovered {len(all_functions)} user-defined function(s)")
     
@@ -1779,42 +2063,25 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
             print(f"    [WARNING] Source file not found for {func_name}, skipping")
             continue
         
-        # Build CFG using Clang
-        cfg = None
+        # Build CFG using Clang (NO FALLBACK - must succeed)
         try:
-            cfg = ClangIntegration.build_cfg_from_clang(source_file, func_name)
-            if not cfg or not cfg.nodes or len(cfg.nodes) < 2:
-                print(f"    [WARNING] Clang CFG extraction incomplete for {func_name}, using fallback")
-                cfg = None
+            cfg = ClangIntegration.build_cfg_from_clang(source_file, func_name, compile_args_map)
+            
+            # Validate CFG was extracted correctly
+            if not cfg:
+                raise RuntimeError("CFG extraction returned None")
+            if not cfg.nodes:
+                raise RuntimeError("CFG has no nodes")
+            if len(cfg.nodes) < 2:
+                raise RuntimeError(f"CFG has only {len(cfg.nodes)} node(s), expected >= 2")
+            
+            print(f"    [OK] CFG extracted: {len(cfg.nodes)} nodes, {len(cfg.edges)} edges")
+            
         except Exception as e:
-            print(f"    [WARNING] Clang CFG extraction failed for {func_name}: {e}")
-            cfg = None
-        
-        # Fallback to heuristic parser if Clang CFG extraction failed
-        if cfg is None:
-            try:
-                # Read file and use heuristic parser
-                code = CFGBuilder._read_cpp_file(source_file)
-                if code:
-                    preprocessed = CFGBuilder._preprocess_code(code)
-                    functions = CFGBuilder._find_functions(preprocessed)
-                    selected_func = None
-                    for f in functions:
-                        if f['name'] == func_name:
-                            selected_func = f
-                            break
-                    
-                    if selected_func:
-                        cfg = CFGBuilder._extract_cfg_from_function(selected_func)
-                        print(f"    [INFO] Using heuristic parser fallback for {func_name}")
-            except Exception as e2:
-                print(f"    [ERROR] All CFG extraction methods failed for {func_name}: {e2}")
-                print(f"    Aborting due to CFG build failure.")
-                sys.exit(1)
-        
-        if not cfg or not cfg.nodes:
-            print(f"    [ERROR] Could not build CFG for {func_name}, skipping")
-            continue
+            print(f"    [ERROR] Clang CFG extraction FAILED for {func_name}:")
+            print(f"      {e}")
+            print(f"    [ERROR] Aborting - CFG extraction is required for all functions")
+            sys.exit(1)
         
         # Validate CFG
         cfg_validator = CFGValidationAgent()
@@ -1884,8 +2151,27 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         
         registry.add_function(func_info)
     
-    # Step 5: Build global CallGraph
-    print(f"\nStep 5: Building global CallGraph...")
+    # Step 5: Validation - ensure all functions were processed
+    print(f"\nStep 5: Validating function processing...")
+    
+    if len(all_cfgs) != len(all_functions):
+        print(f"  [ERROR] CFG count mismatch!")
+        print(f"    Discovered functions: {len(all_functions)}")
+        print(f"    Generated CFGs: {len(all_cfgs)}")
+        print(f"  [ERROR] Aborting - not all functions were processed")
+        sys.exit(1)
+    
+    if len(all_cfgs) < 5:
+        print(f"  [WARNING] Only {len(all_cfgs)} function(s) processed")
+        print(f"  [WARNING] Expected at least 5 functions. This may indicate:")
+        print(f"    - Filtering too strict")
+        print(f"    - Clang parsing issues")
+        print(f"    - Project has very few functions")
+    
+    print(f"  [OK] All {len(all_cfgs)} function(s) processed successfully")
+    
+    # Step 6: Build global CallGraph
+    print(f"\nStep 6: Building global CallGraph...")
     
     # Aggregate all calls from all CFGs
     for cfg in all_cfgs:
@@ -1898,8 +2184,8 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
     
     print(f"  [OK] Global CallGraph built with {len(global_callgraph.calls)} function(s)")
     
-    # Step 6: Validate global CallGraph
-    print("\nStep 6: Validating global CallGraph...")
+    # Step 7: Validate global CallGraph
+    print("\nStep 7: Validating global CallGraph...")
     cg_validator = CallGraphValidationAgent()
     all_valid = True
     for cfg in all_cfgs:
