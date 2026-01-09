@@ -35,6 +35,13 @@ output.mermaid
 output/
 !/output/.gitkeep
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
 # Test files (if any)
 test_*.json
 
