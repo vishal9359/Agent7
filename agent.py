@@ -271,9 +271,90 @@ class ClangIntegration:
         return ClangIntegration._initialize_clang()
     
     @staticmethod
+    def _is_user_defined_function(cursor: Cursor, project_root: str) -> bool:
+        """
+        Strict filtering: Only accept user-defined functions from project path.
+        
+        Returns True only if:
+        - Function is a definition (not just declaration)
+        - Function location file is within project_root
+        - Function name doesn't start with "__" (compiler builtins)
+        - Function name doesn't start with "operator" (operator overloads)
+        - Function name doesn't contain "<" or ">" (template instantiations)
+        - Function is not implicit
+        - Function is not from system header
+        """
+        # Must be a function declaration or method
+        if cursor.kind not in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD]:
+            return False
+        
+        # Must be a definition, not just declaration
+        if not cursor.is_definition():
+            return False
+        
+        # Must not be implicit (compiler-generated)
+        if cursor.is_implicit():
+            return False
+        
+        # Get function name
+        func_name = cursor.spelling
+        if not func_name or len(func_name) == 0:
+            return False
+        
+        # Reject compiler builtins (names starting with __)
+        if func_name.startswith("__"):
+            return False
+        
+        # Reject operator overloads
+        if func_name.startswith("operator"):
+            return False
+        
+        # Reject template instantiations (contain < or >)
+        if "<" in func_name or ">" in func_name:
+            return False
+        
+        # Reject anonymous functions
+        if func_name.startswith("_Z") or func_name.startswith("__Z"):  # Name mangling
+            return False
+        
+        # Get file location - must be within project root
+        location = cursor.location
+        if not location:
+            return False
+        
+        file_obj = location.file
+        if not file_obj:
+            return False
+        
+        file_path = file_obj.name
+        if not file_path:
+            return False
+        
+        # Normalize paths for comparison
+        file_path_abs = os.path.abspath(file_path)
+        project_root_abs = os.path.abspath(project_root)
+        
+        # File must be inside project root
+        if not file_path_abs.startswith(project_root_abs):
+            return False
+        
+        # Check if it's a system header (additional safety check)
+        # System headers typically have paths like /usr/include, /usr/lib, etc.
+        system_paths = ['/usr/include', '/usr/lib', '/usr/local/include', 
+                       '/usr/local/lib', '/opt', '/usr/share']
+        file_path_lower = file_path.lower()
+        for sys_path in system_paths:
+            if sys_path in file_path_abs:
+                return False
+        
+        return True
+    
+    @staticmethod
     def discover_all_functions(source_dir: str) -> List[FunctionInfo]:
         """
-        Discover all function definitions using Clang AST.
+        Discover all user-defined function definitions using Clang AST.
+        
+        STRICT FILTERING: Only functions from project path, no system/STL functions.
         
         Returns list of FunctionInfo objects.
         """
@@ -288,28 +369,37 @@ class ClangIntegration:
                 "DO NOT continue without Clang - this is required."
             )
         
+        # Normalize project root path
+        project_root = os.path.abspath(source_dir)
+        
         functions = []
         index = Index.create()
         
-        # Find all C++ files
+        # Find all C++ files ONLY within project directory
         cpp_files = []
         for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++']:
-            cpp_files.extend(glob.glob(os.path.join(source_dir, ext)))
-            cpp_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
+            # Only search within project directory
+            pattern = os.path.join(project_root, ext)
+            cpp_files.extend(glob.glob(pattern))
+            # Recursive search but only within project
+            pattern_recursive = os.path.join(project_root, '**', ext)
+            cpp_files.extend(glob.glob(pattern_recursive, recursive=True))
+        
+        # Filter to only files actually in project root
+        cpp_files = [f for f in cpp_files if os.path.abspath(f).startswith(project_root)]
         
         if not cpp_files:
             print(f"[WARNING] No C++ files found in {source_dir}")
             return functions
         
         # Try to find compile_commands.json
-        compile_commands = None
+        args = ['-std=c++17', '-x', 'c++']
         compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
         if not os.path.exists(compile_commands_path):
             # Check parent directories
             parent = os.path.dirname(source_dir)
             compile_commands_path = os.path.join(parent, 'compile_commands.json')
         
-        args = ['-std=c++17', '-x', 'c++']
         if os.path.exists(compile_commands_path):
             try:
                 with open(compile_commands_path, 'r') as f:
@@ -319,33 +409,56 @@ class ClangIntegration:
                 print(f"  [WARNING] Could not parse compile_commands.json: {e}")
         
         print(f"  [INFO] Parsing {len(cpp_files)} C++ file(s) with Clang...")
+        print(f"  [INFO] Project root: {project_root}")
+        
+        rejected_count = 0
+        system_functions = []
         
         for cpp_file in cpp_files[:50]:  # Limit to 50 files for performance
             try:
-                # Parse translation unit
-                tu = index.parse(cpp_file, args=args)
+                # Parse translation unit - include function bodies, skip system headers where possible
+                parse_options = TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD | TranslationUnit.PARSE_INCOMPLETE
+                tu = index.parse(cpp_file, args=args, options=parse_options)
                 
-                # Walk AST to find function definitions
+                    # Walk AST to find function definitions
                 def visit_node(cursor: Cursor):
-                    if cursor.kind == CursorKind.FUNCTION_DECL:
-                        # Get function name
-                        func_name = cursor.spelling
-                        if not func_name:
+                    nonlocal rejected_count
+                    
+                    # Skip system headers early
+                    if cursor.location and cursor.location.file:
+                        file_path = cursor.location.file.name
+                        if file_path and not os.path.abspath(file_path).startswith(project_root):
+                            # Skip entire subtrees from system headers
                             return
-                        
-                        # Skip if it's a declaration without definition
-                        if not cursor.is_definition():
-                            return
-                        
-                        # Get full qualified name
-                        full_name = ClangIntegration._get_qualified_name(cursor)
-                        
-                        func_info = FunctionInfo(
-                            name=func_name,
-                            source_file=os.path.basename(cpp_file),
-                            full_name=full_name
-                        )
-                        functions.append(func_info)
+                    
+                    # Check if it's a user-defined function (FUNCTION_DECL or CXX_METHOD)
+                    if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD]:
+                        if ClangIntegration._is_user_defined_function(cursor, project_root):
+                            func_name = cursor.spelling
+                            
+                            # Get file location for verification
+                            location = cursor.location
+                            file_path = location.file.name if location and location.file else ""
+                            
+                            # Get full qualified name
+                            full_name = ClangIntegration._get_qualified_name(cursor)
+                            
+                            func_info = FunctionInfo(
+                                name=func_name,
+                                source_file=os.path.basename(file_path) if file_path else os.path.basename(cpp_file),
+                                full_name=full_name
+                            )
+                            functions.append(func_info)
+                        else:
+                            # Track rejected functions for validation
+                            func_name = cursor.spelling
+                            if func_name:
+                                location = cursor.location
+                                if location and location.file:
+                                    file_path = location.file.name
+                                    if file_path and not os.path.abspath(file_path).startswith(project_root):
+                                        system_functions.append(func_name)
+                                        rejected_count += 1
                     
                     # Recurse into children
                     for child in cursor.get_children():
@@ -357,7 +470,34 @@ class ClangIntegration:
                 print(f"  [WARNING] Failed to parse {cpp_file}: {e}")
                 continue
         
-        print(f"  [OK] Discovered {len(functions)} function(s)")
+        # Validation: Check for too many system functions
+        total_attempted = len(functions) + rejected_count
+        if total_attempted > 0:
+            system_ratio = rejected_count / total_attempted
+            if system_ratio > 0.1:  # More than 10% are system functions
+                print(f"  [WARNING] High ratio of system functions detected: {system_ratio:.1%}")
+                print(f"    User functions: {len(functions)}, System/rejected: {rejected_count}")
+        
+        # Check for operator overloads (should be rejected by filter, but verify)
+        operator_overloads = [f for f in functions if f.name.startswith("operator")]
+        if operator_overloads:
+            print(f"  [ERROR] Operator overloads detected (should be filtered): {[f.name for f in operator_overloads[:5]]}")
+            # Remove them
+            functions = [f for f in functions if not f.name.startswith("operator")]
+        
+        # Final validation
+        if len(functions) == 0:
+            print(f"  [ERROR] No user-defined functions found in project path")
+            print(f"  [ERROR] This may indicate a filtering issue or empty project")
+            raise RuntimeError("No valid user-defined functions found")
+        
+        if len(functions) == 1:
+            print(f"  [WARNING] Only one function detected - this may indicate a problem")
+        
+        print(f"  [OK] Discovered {len(functions)} user-defined function(s)")
+        if rejected_count > 0:
+            print(f"  [INFO] Filtered out {rejected_count} system/STL/compiler functions")
+        
         return functions
     
     @staticmethod
@@ -1439,6 +1579,13 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
             print(f"  Make sure the path is correct and points to a local directory.")
         sys.exit(1)
     
+    # Step 1.5: Get Agent7 repository root (where agent.py is located)
+    AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    OUTPUT_ROOT = os.path.join(AGENT_ROOT, "output")
+    
+    print(f"[INFO] Agent root: {AGENT_ROOT}")
+    print(f"[INFO] Output will be written to: {OUTPUT_ROOT}")
+    
     # Step 2: Initialize Clang and discover ALL functions
     print("Step 2: Initializing Clang and discovering ALL functions...")
     
@@ -1463,10 +1610,10 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
     if len(all_functions) == 1:
         print("  [WARNING] Only one function detected. This may indicate a problem.")
     
-    print(f"  [OK] Discovered {len(all_functions)} function(s)")
+    print(f"  [OK] Discovered {len(all_functions)} user-defined function(s)")
     
-    # Step 3: Create output directory structure
-    output_dir = os.path.join(source_dir, "output")
+    # Step 3: Create output directory structure in Agent7 repository
+    output_dir = OUTPUT_ROOT
     if not dry_run:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "cfg"), exist_ok=True)
@@ -1476,16 +1623,32 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
     # Step 4: Process EACH function
     print(f"\nStep 4: Processing {len(all_functions)} function(s)...")
     
+    # Validation: Ensure no system functions leaked through
+    system_function_names = [f.name for f in all_functions 
+                            if f.name.startswith("__") or f.name.startswith("operator")]
+    if system_function_names:
+        print(f"  [ERROR] System/compiler functions detected in results:")
+        for name in system_function_names[:10]:
+            print(f"    - {name}")
+        print(f"  [ERROR] Aborting - filtering failed")
+        sys.exit(1)
+    
     registry = FunctionRegistry()
     all_cfgs = []
     global_callgraph = CallGraph()
     
-    # Find source files
+    # Find source files ONLY within project directory
+    project_root_abs = os.path.abspath(source_dir)
     source_files_map = {}
     cpp_files = []
     for ext in ['*.cpp', '*.cc', '*.cxx', '*.c++']:
-        cpp_files.extend(glob.glob(os.path.join(source_dir, ext)))
-        cpp_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
+        pattern = os.path.join(project_root_abs, ext)
+        cpp_files.extend(glob.glob(pattern))
+        pattern_recursive = os.path.join(project_root_abs, '**', ext)
+        cpp_files.extend(glob.glob(pattern_recursive, recursive=True))
+    
+    # Filter to only files in project root
+    cpp_files = [f for f in cpp_files if os.path.abspath(f).startswith(project_root_abs)]
     
     for cpp_file in cpp_files:
         basename = os.path.basename(cpp_file)
@@ -1586,7 +1749,14 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         
         # Save artifacts for this function
         if not dry_run:
-            safe_func_name = func_name.replace(':', '_').replace('/', '_').replace('\\', '_')
+            # Create safe filename (should never have operators since they're filtered, but be safe)
+            safe_func_name = func_name.replace(':', '_').replace('/', '_').replace('\\', '_').replace('<', '_').replace('>', '_').replace('*', '_').replace('&', '_').replace(' ', '_').replace('"', '_').replace("'", '_')
+            
+            # Final safety check - abort if somehow an operator got through
+            if safe_func_name.startswith("operator"):
+                print(f"    [ERROR] Operator overload detected in filename: {safe_func_name}")
+                print(f"    [ERROR] Aborting - filtering validation failed")
+                sys.exit(1)
             
             # Save CFG
             cfg_path = os.path.join(output_dir, "cfg", f"{safe_func_name}.json")
@@ -1640,23 +1810,45 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         CallGraphBuilder.save_callgraph(global_callgraph, cg_output)
         print(f"  [OK] Saved global CallGraph to: {cg_output}")
     
-    # Step 7: Summary
+    # Step 7: Final validation and summary
     print("\n" + "=" * 60)
     print("=== PROCESSING COMPLETE ===")
     print("=" * 60)
-    print(f"\nProcessed {len(all_functions)} function(s):")
+    
+    # Final validation: Ensure output is in Agent7 repository, not project path
+    output_dir_abs = os.path.abspath(output_dir)
+    agent_root_abs = os.path.abspath(AGENT_ROOT)
+    
+    if not output_dir_abs.startswith(agent_root_abs):
+        print(f"\n[ERROR] Output directory validation FAILED!")
+        print(f"  Output: {output_dir_abs}")
+        print(f"  Agent root: {agent_root_abs}")
+        print(f"  Output must be inside Agent7 repository")
+        sys.exit(1)
+    
+    # Final validation: No operator overloads or system functions
+    final_system_funcs = [f.name for f in all_functions 
+                         if f.name.startswith("__") or f.name.startswith("operator")]
+    if final_system_funcs:
+        print(f"\n[ERROR] Final validation FAILED - system functions detected:")
+        for name in final_system_funcs[:10]:
+            print(f"  - {name}")
+        sys.exit(1)
+    
+    print(f"\nProcessed {len(all_functions)} user-defined function(s):")
     for func_info in all_functions:
         if func_info.cfg:
             print(f"  - {func_info.name}: {len(func_info.cfg.nodes)} nodes, {len(func_info.cfg.edges)} edges")
     
     if not dry_run:
         print(f"\n=== OUTPUT STRUCTURE ===")
-        print(f"output/")
+        print(f"Agent7/output/")
         print(f" ├── cfg/ ({len(all_functions)} files)")
         print(f" ├── description/ ({len(all_functions)} files)")
         print(f" ├── diagrams/ ({len(all_functions)} files)")
         print(f" └── callgraph.json")
         print(f"\nAll artifacts saved to: {output_dir}")
+        print(f"  (Inside Agent7 repository, not project path)")
 
 
 def load_from_json(cfg_file: str, desc_file: str, callgraph_file: Optional[str] = None):
