@@ -271,6 +271,158 @@ class ClangIntegration:
         return ClangIntegration._initialize_clang()
     
     @staticmethod
+    def discover_compile_arguments(project_root: str) -> List[str]:
+        """
+        Discover compile arguments heuristically when compile_commands.json is not available.
+        
+        Strategy:
+        1. Try to parse CMakeLists.txt for include directories and flags
+        2. Discover common include directories in the project
+        3. Use default C++ standard flags
+        4. Add system include paths from Clang
+        
+        Returns a list of compile arguments to use with Clang.
+        """
+        args = []
+        
+        # 1. C++ standard (try to detect from CMakeLists.txt, default to c++17)
+        cpp_std = '-std=c++17'
+        cmake_file = os.path.join(project_root, 'CMakeLists.txt')
+        if os.path.exists(cmake_file):
+            try:
+                with open(cmake_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    cmake_content = f.read()
+                    # Look for CXX_STANDARD settings
+                    if 'CXX_STANDARD 14' in cmake_content or 'set(CMAKE_CXX_STANDARD 14' in cmake_content:
+                        cpp_std = '-std=c++14'
+                    elif 'CXX_STANDARD 11' in cmake_content or 'set(CMAKE_CXX_STANDARD 11' in cmake_content:
+                        cpp_std = '-std=c++11'
+                    elif 'CXX_STANDARD 20' in cmake_content or 'set(CMAKE_CXX_STANDARD 20' in cmake_content:
+                        cpp_std = '-std=c++20'
+            except Exception:
+                pass
+        args.append(cpp_std)
+        
+        # 2. Language specification
+        args.extend(['-x', 'c++'])
+        
+        # 3. Discover include directories
+        include_dirs = set()
+        
+        # Common include directory patterns
+        common_patterns = [
+            'include', 'includes', 'inc', 'headers', 'hdr',
+            'src', 'source', 'sources',
+            'lib', 'libs', 'library', 'libraries',
+            'third_party', 'third-party', 'external',
+            'common', 'shared', 'utils', 'utilities'
+        ]
+        
+        # Walk project directory (limited depth for performance)
+        max_depth = 3
+        for root, dirs, files in os.walk(project_root):
+            # Limit depth
+            depth = root[len(project_root):].count(os.sep)
+            if depth >= max_depth:
+                dirs.clear()  # Don't descend further
+                continue
+            
+            # Check if this directory matches common patterns
+            dir_name = os.path.basename(root).lower()
+            if any(pattern in dir_name for pattern in common_patterns):
+                # Check if it contains header files
+                has_headers = any(f.endswith(('.h', '.hpp', '.hxx', '.hh')) for f in files)
+                if has_headers or 'include' in dir_name:
+                    abs_dir = os.path.abspath(root)
+                    include_dirs.add(abs_dir)
+                    # Also add parent if it looks like a project root
+                    parent = os.path.dirname(abs_dir)
+                    if os.path.basename(parent) in ['src', 'source', 'lib']:
+                        include_dirs.add(parent)
+        
+        # Add discovered include directories
+        for inc_dir in sorted(include_dirs):
+            args.append(f'-I{inc_dir}')
+        
+        # 4. Try to read include paths from CMakeLists.txt (simple regex)
+        if os.path.exists(cmake_file):
+            try:
+                with open(cmake_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    # Look for include_directories() calls
+                    import re
+                    # Match: include_directories(dir1 dir2 ...) or include_directories(${VAR})
+                    pattern = r'include_directories\s*\(([^)]+)\)'
+                    matches = re.findall(pattern, content)
+                    for match in matches:
+                        # Split by whitespace and process each path
+                        dirs = match.split()
+                        for d in dirs:
+                            d = d.strip()
+                            # Skip variables like ${CMAKE_SOURCE_DIR}
+                            if d.startswith('${') or d.startswith('$'):
+                                continue
+                            # Make absolute path relative to project root
+                            if os.path.isabs(d):
+                                abs_path = d
+                            else:
+                                abs_path = os.path.abspath(os.path.join(project_root, d))
+                            if os.path.isdir(abs_path):
+                                args.append(f'-I{abs_path}')
+            except Exception:
+                pass
+        
+        # 5. Add parent directories as potential include paths (up to 2 levels)
+        current = project_root
+        for _ in range(2):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            # Check if parent has common include directories
+            for pattern in ['include', 'src', 'lib']:
+                potential = os.path.join(parent, pattern)
+                if os.path.isdir(potential):
+                    args.append(f'-I{potential}')
+            current = parent
+        
+        # 6. Get system include paths from Clang (if available)
+        try:
+            # Try to get default system includes from clang itself
+            import subprocess
+            result = subprocess.run(
+                ['clang++', '-E', '-x', 'c++', '-', '-v'],
+                input='',
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            # Parse output for system include paths
+            lines = result.stderr.split('\n')
+            in_includes = False
+            for line in lines:
+                if 'End of search list' in line:
+                    break
+                if in_includes and line.strip():
+                    # Extract include path
+                    path = line.strip()
+                    if os.path.isdir(path):
+                        args.append(f'-isystem{path}')
+                if '#include <...>' in line or 'search starts here' in line:
+                    in_includes = True
+        except Exception:
+            # If clang++ is not available, continue without system includes
+            pass
+        
+        # 7. Common compiler flags (non-strict parsing)
+        args.extend([
+            '-Wno-everything',  # Suppress all warnings for best-effort parsing
+            '-ferror-limit=0',  # Don't stop on errors
+            '-fparse-all-comments',  # Parse comments
+        ])
+        
+        return args
+    
+    @staticmethod
     def _is_user_defined_function(cursor: Cursor, project_root: str) -> bool:
         """
         Strict filtering: Only accept user-defined functions from project path.
@@ -411,67 +563,71 @@ class ClangIntegration:
             print(f"[WARNING] No C++ files found in {source_dir}")
             return functions
         
-        # REQUIRE compile_commands.json
-        compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
-        if not os.path.exists(compile_commands_path):
-            # Check parent directories (up to 3 levels)
-            checked_paths = [compile_commands_path]
+        # Try to load compile_commands.json (optional - fallback to heuristic discovery)
+        fallback_args = None
+        if compile_args_map is None:
+            compile_args_map = {}
+            compile_commands_path = None
+            
+            # Check source_dir and parent directories (up to 3 levels)
+            checked_paths = []
             current_dir = source_dir
-            for _ in range(3):
+            for _ in range(4):  # Include source_dir itself
+                potential_path = os.path.join(current_dir, 'compile_commands.json')
+                checked_paths.append(potential_path)
+                if os.path.exists(potential_path):
+                    compile_commands_path = potential_path
+                    break
                 parent = os.path.dirname(current_dir)
                 if parent == current_dir:
                     break
-                compile_commands_path = os.path.join(parent, 'compile_commands.json')
-                checked_paths.append(compile_commands_path)
-                if os.path.exists(compile_commands_path):
-                    break
                 current_dir = parent
-        
-        if not os.path.exists(compile_commands_path):
-            error_msg = (
-                f"[ERROR] compile_commands.json is REQUIRED but not found.\n"
-                f"  Searched in:\n"
-            )
-            for path in checked_paths[:5]:
-                error_msg += f"    - {path}\n"
-            error_msg += (
-                f"\n  Please generate compile_commands.json:\n"
-                f"    - cmake: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .\n"
-                f"    - bear: bear make\n"
-                f"    - clang-tidy: clang-tidy -p .\n"
-            )
-            raise RuntimeError(error_msg)
-        
-        # Load compile_commands.json
-        compile_commands = None
-        try:
-            with open(compile_commands_path, 'r') as f:
-                compile_commands = json.load(f)
-            print(f"  [OK] Found and loaded compile_commands.json: {compile_commands_path}")
-        except Exception as e:
-            raise RuntimeError(
-                f"[ERROR] Failed to parse compile_commands.json: {e}\n"
-                f"  Path: {compile_commands_path}\n"
-                f"  Please fix or regenerate compile_commands.json"
-            )
-        
-        if not compile_commands or not isinstance(compile_commands, list):
-            raise RuntimeError(
-                f"[ERROR] compile_commands.json is invalid or empty\n"
-                f"  Expected: array of compile command objects"
-            )
-        
-        # Build file -> compile args mapping
-        compile_args_map = {}
-        for entry in compile_commands:
-            file_path = entry.get('file', '')
-            if file_path:
-                # Normalize path
-                abs_file = os.path.abspath(file_path)
-                compile_args_map[abs_file] = entry.get('arguments', entry.get('command', '').split())
-                # Also map by basename
-                basename = os.path.basename(file_path)
-                compile_args_map[basename] = entry.get('arguments', entry.get('command', '').split())
+            
+            if compile_commands_path and os.path.exists(compile_commands_path):
+                # Load compile_commands.json if found
+                try:
+                    with open(compile_commands_path, 'r') as f:
+                        compile_commands = json.load(f)
+                    
+                    if compile_commands and isinstance(compile_commands, list):
+                        print(f"  [OK] Found compile_commands.json: {compile_commands_path}")
+                        
+                        # Build file -> compile args mapping
+                        for entry in compile_commands:
+                            file_path = entry.get('file', '')
+                            if file_path:
+                                # Normalize path
+                                abs_file = os.path.abspath(file_path)
+                                args = entry.get('arguments', [])
+                                if not args:
+                                    # Parse command string if arguments not available
+                                    cmd = entry.get('command', '')
+                                    if cmd:
+                                        import shlex
+                                        args = shlex.split(cmd)
+                                
+                                if args:
+                                    compile_args_map[abs_file] = args
+                                    # Also map by basename
+                                    basename = os.path.basename(file_path)
+                                    compile_args_map[basename] = args
+                    else:
+                        print(f"  [WARNING] compile_commands.json is invalid, using fallback discovery")
+                except Exception as e:
+                    print(f"  [WARNING] Failed to parse compile_commands.json: {e}")
+                    print(f"  [INFO] Falling back to heuristic compile argument discovery")
+            
+            # If compile_commands.json not found or failed, discover arguments heuristically
+            if not compile_args_map:
+                print(f"  [INFO] compile_commands.json not found, discovering compile arguments heuristically...")
+                print(f"  [INFO] This may result in incomplete parsing if includes are missing.")
+                fallback_args = ClangIntegration.discover_compile_arguments(project_root)
+                print(f"  [INFO] Discovered {len(fallback_args)} compile arguments")
+                # Show preview
+                preview = ' '.join(fallback_args[:8])
+                if len(fallback_args) > 8:
+                    preview += ' ...'
+                print(f"  [DEBUG] Args preview: {preview}")
         
         print(f"  [INFO] Parsing {len(cpp_files)} C++ file(s) with Clang...")
         print(f"  [INFO] Project root: {project_root}")
@@ -712,7 +868,7 @@ class ClangIntegration:
         return '::'.join(filter(None, parts))
     
     @staticmethod
-    def build_cfg_from_clang(source_file: str, function_name: str, compile_args_map: Dict[str, List[str]] = None) -> Optional[CFG]:
+    def build_cfg_from_clang(source_file: str, function_name: str, compile_args_map: Dict[str, List[str]] = None, fallback_args: List[str] = None) -> Optional[CFG]:
         """
         Build CFG for a specific function using Clang's AST.
         
@@ -752,24 +908,46 @@ class ClangIntegration:
                         compile_commands = json.load(f)
                     for entry in compile_commands:
                         if entry.get('file') == source_file_abs or os.path.basename(entry.get('file', '')) == os.path.basename(source_file):
-                            args = entry.get('arguments', entry.get('command', '').split())
+                            args = entry.get('arguments', [])
+                            if not args:
+                                cmd = entry.get('command', '')
+                                if cmd:
+                                    import shlex
+                                    args = shlex.split(cmd)
                             break
                 except Exception:
                     pass
         
+        # If still no args, use fallback_args or discover heuristically
         if not args:
-            raise RuntimeError(
-                f"[ERROR] Cannot find compile arguments for {source_file}\n"
-                f"  This file is not listed in compile_commands.json\n"
-                f"  Ensure compile_commands.json contains an entry for this file"
-            )
-        
-        # Remove output flags and ensure proper parsing
-        parse_args = [arg for arg in args if arg not in ['-o', '-c'] and not arg.endswith('.o')]
-        if '-x' not in parse_args:
-            parse_args.extend(['-x', 'c++'])
+            if fallback_args:
+                # Use provided fallback arguments
+                parse_args = list(fallback_args)
+            else:
+                # Discover arguments heuristically
+                project_root = os.path.dirname(source_file_abs)
+                # Try to find project root (go up a few levels to find common project root)
+                for _ in range(4):
+                    if os.path.exists(os.path.join(project_root, 'CMakeLists.txt')) or \
+                       os.path.exists(os.path.join(project_root, 'Makefile')) or \
+                       os.path.exists(os.path.join(project_root, '.git')):
+                        break
+                    parent = os.path.dirname(project_root)
+                    if parent == project_root:
+                        break
+                    project_root = parent
+                
+                parse_args = ClangIntegration.discover_compile_arguments(project_root)
+                print(f"  [INFO] Using heuristically discovered compile arguments for {os.path.basename(source_file)}")
+        else:
+            # Remove output flags and ensure proper parsing
+            parse_args = [arg for arg in args if arg not in ['-o', '-c'] and not arg.endswith('.o')]
+            if '-x' not in parse_args:
+                parse_args.extend(['-x', 'c++'])
         
         # Parse with proper options
+        parse_options = 0
+        # Parse options - use INCOMPLETE to handle missing includes gracefully
         parse_options = 0
         try:
             parse_options |= TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
@@ -777,23 +955,42 @@ class ClangIntegration:
             pass
         
         try:
+            parse_options |= TranslationUnit.PARSE_INCOMPLETE
+        except AttributeError:
+            pass
+        
+        try:
             tu = index.parse(source_file, args=parse_args, options=parse_options)
         except Exception as e:
-            raise RuntimeError(
-                f"[ERROR] Failed to parse translation unit for {source_file}: {e}\n"
-                f"  This indicates Clang cannot parse the file correctly"
-            )
+            # If parsing fails, try with INCOMPLETE mode (for missing includes)
+            print(f"  [WARNING] Initial parse failed for {os.path.basename(source_file)}, trying with INCOMPLETE mode...")
+            try:
+                parse_options = TranslationUnit.PARSE_INCOMPLETE
+                tu = index.parse(source_file, args=parse_args, options=parse_options)
+            except Exception as e2:
+                raise RuntimeError(
+                    f"[ERROR] Failed to parse translation unit for {source_file}: {e2}\n"
+                    f"  This indicates Clang cannot parse the file correctly\n"
+                    f"  Try generating compile_commands.json for more accurate parsing"
+                )
         
-        # Check diagnostics
+        # Check diagnostics (but don't fail on errors if using fallback)
         diags = list(tu.diagnostics)
         errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
         if errors:
-            error_msgs = [f"    {d.spelling} (line {d.location.line})" for d in errors[:5]]
-            raise RuntimeError(
-                f"[ERROR] Clang parsing errors in {source_file}:\n" +
-                "\n".join(error_msgs) +
-                f"\n  Cannot extract CFG with parsing errors"
-            )
+            error_msgs = [f"    {d.spelling} (line {d.location.line})" for d in errors[:3]]
+            if not fallback_args and not args:
+                # Using heuristic discovery - warn but continue
+                print(f"  [WARNING] Clang parsing errors in {os.path.basename(source_file)} (using heuristic discovery):")
+                for msg in error_msgs:
+                    print(msg)
+                print(f"  [INFO] Continuing with best-effort parsing...")
+            else:
+                # Using compile_commands.json but still have errors - more serious
+                print(f"  [WARNING] Clang parsing errors in {os.path.basename(source_file)}:")
+                for msg in error_msgs:
+                    print(msg)
+                print(f"  [INFO] Continuing with best-effort parsing...")
         
         target_func = None
         
@@ -1927,95 +2124,71 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         print("  3. Set LIBCLANG_LIBRARY_PATH if needed")
         sys.exit(1)
     
-    # Load compile_commands.json first (needed for function discovery and CFG extraction)
-    compile_commands_path = os.path.join(source_dir, 'compile_commands.json')
-    if not os.path.exists(compile_commands_path):
-        # Check parent directories (up to 3 levels)
-        checked_paths = [compile_commands_path]
-        current_dir = source_dir
-        for _ in range(3):
-            parent = os.path.dirname(current_dir)
-            if parent == current_dir:
-                break
-            compile_commands_path = os.path.join(parent, 'compile_commands.json')
-            checked_paths.append(compile_commands_path)
-            if os.path.exists(compile_commands_path):
-                break
-            current_dir = parent
-    
-        if not os.path.exists(compile_commands_path):
-            error_msg = (
-                f"\n[ERROR] compile_commands.json is REQUIRED but not found.\n"
-                f"\n"
-                f"WHY IS IT NEEDED?\n"
-                f"  Clang (the C++ parser) needs compile_commands.json to know:\n"
-                f"    - Include paths (where to find header files)\n"
-                f"    - Compiler flags (-std=c++17, -D defines, etc.)\n"
-                f"    - Preprocessor macros\n"
-                f"    - System library paths\n"
-                f"\n"
-                f"  Without it, Clang cannot properly parse C++ code with includes,\n"
-                f"  macros, or complex build configurations.\n"
-                f"\n"
-                f"SEARCHED IN:\n"
-            )
-            for path in checked_paths[:5]:
-                error_msg += f"    - {path}\n"
-            error_msg += (
-                f"\n"
-                f"HOW TO GENERATE compile_commands.json:\n"
-                f"\n"
-                f"  Option 1 (CMake projects):\n"
-                f"    cd <project_root>\n"
-                f"    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .\n"
-                f"    # or if build directory:\n"
-                f"    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON <build_dir>\n"
-                f"\n"
-                f"  Option 2 (Make projects):\n"
-                f"    cd <project_root>\n"
-                f"    bear -- make\n"
-                f"    # or: bear -- make -j8\n"
-                f"\n"
-                f"  Option 3 (Custom build):\n"
-                f"    Install 'bear' or 'compiledb'\n"
-                f"    Run: bear -- <your_build_command>\n"
-                f"\n"
-                f"  The compile_commands.json should be in the project root directory.\n"
-                f"\n"
-            )
-            print(error_msg)
-            sys.exit(1)
-    
-    # Load compile_commands.json
-    compile_commands = None
+    # Try to load compile_commands.json (optional - will use fallback if not found)
+    compile_commands_path = None
     compile_args_map = {}
-    try:
-        with open(compile_commands_path, 'r') as f:
-            compile_commands = json.load(f)
-        print(f"  [OK] Found compile_commands.json: {compile_commands_path}")
-        
-        # Build file -> compile args mapping
-        for entry in compile_commands:
-            file_path = entry.get('file', '')
-            if file_path:
-                abs_file = os.path.abspath(file_path)
-                args = entry.get('arguments', [])
-                if not args:
-                    # Parse command string if arguments not available
-                    cmd = entry.get('command', '')
-                    if cmd:
-                        import shlex
-                        args = shlex.split(cmd)
-                        # Remove compiler name and output flags
-                        args = [a for a in args[1:] if a not in ['-o', '-c'] and not a.endswith('.o')]
-                compile_args_map[abs_file] = args
-                compile_args_map[os.path.basename(file_path)] = args
-    except Exception as e:
-        raise RuntimeError(
-            f"[ERROR] Failed to load compile_commands.json: {e}\n"
-            f"  Path: {compile_commands_path}\n"
-            f"  Please fix or regenerate compile_commands.json"
-        )
+    fallback_args = None
+    
+    # Check source_dir and parent directories (up to 3 levels)
+    checked_paths = []
+    current_dir = source_dir
+    for _ in range(4):  # Include source_dir itself
+        potential_path = os.path.join(current_dir, 'compile_commands.json')
+        checked_paths.append(potential_path)
+        if os.path.exists(potential_path):
+            compile_commands_path = potential_path
+            break
+        parent = os.path.dirname(current_dir)
+        if parent == current_dir:
+            break
+        current_dir = parent
+    
+    if compile_commands_path and os.path.exists(compile_commands_path):
+        # Load compile_commands.json if found
+        try:
+            with open(compile_commands_path, 'r') as f:
+                compile_commands = json.load(f)
+            
+            if compile_commands and isinstance(compile_commands, list):
+                print(f"  [OK] Found compile_commands.json: {compile_commands_path}")
+                
+                # Build file -> compile args mapping
+                for entry in compile_commands:
+                    file_path = entry.get('file', '')
+                    if file_path:
+                        abs_file = os.path.abspath(file_path)
+                        args = entry.get('arguments', [])
+                        if not args:
+                            # Parse command string if arguments not available
+                            cmd = entry.get('command', '')
+                            if cmd:
+                                import shlex
+                                args = shlex.split(cmd)
+                                # Remove compiler name and output flags
+                                args = [a for a in args[1:] if a not in ['-o', '-c'] and not a.endswith('.o')]
+                        if args:
+                            compile_args_map[abs_file] = args
+                            compile_args_map[os.path.basename(file_path)] = args
+            else:
+                print(f"  [WARNING] compile_commands.json is invalid, using fallback discovery")
+        except Exception as e:
+            print(f"  [WARNING] Failed to parse compile_commands.json: {e}")
+            print(f"  [INFO] Falling back to heuristic compile argument discovery")
+    
+    # If compile_commands.json not found or failed, discover arguments heuristically
+    if not compile_args_map:
+        print(f"  [INFO] compile_commands.json not found - discovering compile arguments heuristically...")
+        print(f"  [INFO] This may result in incomplete parsing if includes are missing.")
+        print(f"  [INFO] For best results, generate compile_commands.json:")
+        print(f"         - CMake: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .")
+        print(f"         - Make: bear -- make")
+        fallback_args = ClangIntegration.discover_compile_arguments(source_dir)
+        print(f"  [OK] Discovered {len(fallback_args)} compile arguments")
+        # Show preview
+        preview = ' '.join(fallback_args[:8])
+        if len(fallback_args) > 8:
+            preview += ' ...'
+        print(f"  [DEBUG] Args preview: {preview}")
     
     try:
         all_functions = ClangIntegration.discover_all_functions(source_dir, compile_args_map)
@@ -2091,9 +2264,9 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
             print(f"    [WARNING] Source file not found for {func_name}, skipping")
             continue
         
-        # Build CFG using Clang (NO FALLBACK - must succeed)
+        # Build CFG using Clang (with fallback args if compile_commands.json not available)
         try:
-            cfg = ClangIntegration.build_cfg_from_clang(source_file, func_name, compile_args_map)
+            cfg = ClangIntegration.build_cfg_from_clang(source_file, func_name, compile_args_map, fallback_args)
             
             # Validate CFG was extracted correctly
             if not cfg:
