@@ -2293,23 +2293,35 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         sys.exit(1)
     
     # Try to load compile_commands.json (optional - will use fallback if not found)
+    # First check in project_root, then check build directories and source_dir
     compile_commands_path = None
     compile_args_map = {}
     fallback_args = None
     
-    # Check source_dir and parent directories (up to 3 levels)
-    checked_paths = []
-    current_dir = source_dir
-    for _ in range(4):  # Include source_dir itself
-        potential_path = os.path.join(current_dir, 'compile_commands.json')
-        checked_paths.append(potential_path)
-        if os.path.exists(potential_path):
-            compile_commands_path = potential_path
-            break
-        parent = os.path.dirname(current_dir)
-        if parent == current_dir:
-            break
-        current_dir = parent
+    # Priority 1: Check in project_root
+    compile_commands_path = os.path.join(project_root, 'compile_commands.json')
+    if not os.path.exists(compile_commands_path):
+        # Priority 2: Check in common build directories under project_root
+        for build_dir_name in ['build', 'builds', 'cmake-build-debug', 'cmake-build-release']:
+            potential_path = os.path.join(project_root, build_dir_name, 'compile_commands.json')
+            if os.path.exists(potential_path):
+                compile_commands_path = potential_path
+                break
+    
+    # Priority 3: Check source_dir and parent directories (up to 3 levels)
+    if not os.path.exists(compile_commands_path):
+        checked_paths = []
+        current_dir = source_dir
+        for _ in range(4):  # Include source_dir itself
+            potential_path = os.path.join(current_dir, 'compile_commands.json')
+            checked_paths.append(potential_path)
+            if os.path.exists(potential_path):
+                compile_commands_path = potential_path
+                break
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:
+                break
+            current_dir = parent
     
     if compile_commands_path and os.path.exists(compile_commands_path):
         # Load compile_commands.json if found
