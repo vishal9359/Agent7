@@ -2257,9 +2257,17 @@ class PrimaryAnalysisAgent:
 # MAIN EXECUTION FLOW
 # ============================================================================
 
-def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool = False):
-    """Build CFG, CallGraph, and Description for ALL functions in C++ source directory"""
-    print(f"[INFO] Building from source directory: {source_dir}\n")
+def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool = False, project_root: Optional[str] = None):
+    """
+    Build CFG, CallGraph, and Description for ALL functions in C++ source directory
+    
+    Args:
+        source_dir: Directory to scan for C++ files (scan_path)
+        reuse_json: Whether to reuse existing JSON files
+        dry_run: Whether to skip saving output files
+        project_root: Optional project root directory. If not provided, will be detected automatically.
+    """
+    source_dir = os.path.normpath(os.path.abspath(source_dir))
     
     # Step 1: Load C++ source directory
     if not os.path.isdir(source_dir):
@@ -2274,12 +2282,21 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
             print(f"  Make sure the path is correct and points to a local directory.")
         sys.exit(1)
     
+    # Determine project root
+    if project_root:
+        project_root = os.path.normpath(os.path.abspath(project_root))
+    else:
+        # Auto-detect project root
+        project_root = ClangIntegration.detect_project_root(source_dir)
+    
     # Step 1.5: Get Agent7 repository root (where agent.py is located)
     AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
     OUTPUT_ROOT = os.path.join(AGENT_ROOT, "output")
     
+    print(f"[INFO] Project root: {project_root}")
+    print(f"[INFO] Scan path: {source_dir}")
     print(f"[INFO] Agent root: {AGENT_ROOT}")
-    print(f"[INFO] Output will be written to: {OUTPUT_ROOT}")
+    print(f"[INFO] Output will be written to: {OUTPUT_ROOT}\n")
     
     # Step 2: Initialize Clang and discover ALL functions
     print("Step 2: Initializing Clang and discovering ALL functions...")
