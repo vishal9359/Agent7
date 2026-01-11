@@ -271,23 +271,160 @@ class ClangIntegration:
         return ClangIntegration._initialize_clang()
     
     @staticmethod
-    def discover_compile_arguments(project_root: str) -> List[str]:
+    def detect_project_root(scan_dir: str) -> str:
+        """
+        Detect the project root by looking for common markers (CMakeLists.txt, .git, etc.)
+        Returns the project root directory, or scan_dir if not found.
+        """
+        current = os.path.normpath(os.path.abspath(scan_dir))
+        max_levels = 10  # Limit search depth
+        
+        for _ in range(max_levels):
+            # Check for project markers
+            markers = ['CMakeLists.txt', '.git', 'Makefile', 'configure', 'configure.ac']
+            for marker in markers:
+                marker_path = os.path.join(current, marker)
+                if os.path.exists(marker_path):
+                    return current
+            
+            # Move up one level
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        
+        # If no markers found, return scan_dir
+        return os.path.normpath(os.path.abspath(scan_dir))
+    
+    @staticmethod
+    def build_hierarchical_include_paths(project_root: str, scan_dir: str) -> List[str]:
+        """
+        Build hierarchical include paths from scan_dir up to project_root.
+        
+        For scan_dir = D:\git-project\poseidonos\src\io\frontend_io
+        and project_root = D:\git-project\poseidonos
+        
+        Returns:
+        -I D:\git-project\poseidonos
+        -I D:\git-project\poseidonos\src
+        -I D:\git-project\poseidonos\src\io
+        -I D:\git-project\poseidonos\src\io\frontend_io
+        """
+        project_root = os.path.normpath(os.path.abspath(project_root))
+        scan_dir = os.path.normpath(os.path.abspath(scan_dir))
+        
+        include_paths = []
+        
+        # Ensure scan_dir is within project_root
+        if not scan_dir.startswith(project_root):
+            # If scan_dir is not within project_root, just add project_root
+            include_paths.append(project_root)
+            if scan_dir != project_root:
+                include_paths.append(scan_dir)
+            return include_paths
+        
+        # Build path from project_root to scan_dir
+        current = scan_dir
+        path_parts = []
+        
+        while current != project_root and current != os.path.dirname(current):
+            path_parts.insert(0, current)
+            current = os.path.dirname(current)
+        
+        # Always add project_root first
+        path_parts.insert(0, project_root)
+        
+        # Add all intermediate directories
+        include_paths.extend(path_parts)
+        
+        return include_paths
+    
+    @staticmethod
+    def find_header_file(header_name: str, project_root: str, existing_include_paths: List[str]) -> Optional[str]:
+        """
+        Search for a header file in the project.
+        
+        Args:
+            header_name: Header name (e.g., "src/io/frontend_io/block_map_update_request.h")
+            project_root: Project root directory
+            existing_include_paths: List of existing include paths
+        
+        Returns:
+            Absolute path to the header file if found, None otherwise
+        """
+        project_root = os.path.normpath(os.path.abspath(project_root))
+        
+        # Try direct path relative to project root
+        direct_path = os.path.join(project_root, header_name)
+        if os.path.isfile(direct_path):
+            return direct_path
+        
+        # Try with each include path as base
+        for inc_path in existing_include_paths:
+            # Remove -I prefix if present
+            inc_path_clean = inc_path.lstrip('-I')
+            inc_path_clean = os.path.normpath(os.path.abspath(inc_path_clean))
+            
+            # Try header_name relative to include path
+            potential_path = os.path.join(inc_path_clean, header_name)
+            if os.path.isfile(potential_path):
+                return potential_path
+            
+            # Try just the basename in the include path
+            basename = os.path.basename(header_name)
+            potential_path = os.path.join(inc_path_clean, basename)
+            if os.path.isfile(potential_path):
+                return potential_path
+        
+        # Try recursive search in project_root (limited depth)
+        header_basename = os.path.basename(header_name)
+        for root, dirs, files in os.walk(project_root):
+            # Limit depth to avoid excessive searching
+            depth = root[len(project_root):].count(os.sep)
+            if depth > 5:
+                dirs.clear()
+                continue
+            
+            if header_basename in files:
+                potential_path = os.path.join(root, header_basename)
+                if os.path.isfile(potential_path):
+                    return potential_path
+        
+        return None
+    
+    @staticmethod
+    def discover_compile_arguments(project_root: str, scan_dir: Optional[str] = None) -> List[str]:
         """
         Discover compile arguments heuristically when compile_commands.json is not available.
         
         Strategy:
-        1. Try to parse CMakeLists.txt for include directories and flags
-        2. Discover common include directories in the project
-        3. Use default C++ standard flags
-        4. Add system include paths from Clang
+        1. Detect project root if scan_dir is provided
+        2. Build hierarchical include paths from scan_dir to project_root
+        3. Try to parse CMakeLists.txt for include directories and flags
+        4. Discover common include directories in the project
+        5. Use default C++ standard flags
+        6. Add system include paths from Clang
+        
+        Args:
+            project_root: Project root directory (or scan directory if root not detected)
+            scan_dir: Optional scan directory (used to build hierarchical include paths)
         
         Returns a list of compile arguments to use with Clang.
         """
         args = []
         
+        # If scan_dir is provided, detect actual project root and build hierarchical paths
+        actual_project_root = project_root
+        if scan_dir:
+            actual_project_root = ClangIntegration.detect_project_root(scan_dir)
+            # Build hierarchical include paths from scan_dir to project_root
+            hierarchical_paths = ClangIntegration.build_hierarchical_include_paths(actual_project_root, scan_dir)
+            for inc_path in hierarchical_paths:
+                args.append(f'-I{inc_path}')
+        
         # 1. C++ standard (try to detect from CMakeLists.txt, default to c++17)
         cpp_std = '-std=c++17'
-        cmake_file = os.path.join(project_root, 'CMakeLists.txt')
+        cmake_file = os.path.join(actual_project_root, 'CMakeLists.txt')
         if os.path.exists(cmake_file):
             try:
                 with open(cmake_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -306,8 +443,14 @@ class ClangIntegration:
         # 2. Language specification
         args.extend(['-x', 'c++'])
         
-        # 3. Discover include directories
+        # 3. Discover additional include directories (if not already added via hierarchical paths)
         include_dirs = set()
+        
+        # Get existing include paths (to avoid duplicates)
+        existing_include_paths = set()
+        for arg in args:
+            if arg.startswith('-I'):
+                existing_include_paths.add(os.path.normpath(os.path.abspath(arg[2:])))
         
         # Common include directory patterns
         common_patterns = [
@@ -320,9 +463,9 @@ class ClangIntegration:
         
         # Walk project directory (limited depth for performance)
         max_depth = 3
-        for root, dirs, files in os.walk(project_root):
+        for root, dirs, files in os.walk(actual_project_root):
             # Limit depth
-            depth = root[len(project_root):].count(os.sep)
+            depth = root[len(actual_project_root):].count(os.sep)
             if depth >= max_depth:
                 dirs.clear()  # Don't descend further
                 continue
@@ -333,16 +476,14 @@ class ClangIntegration:
                 # Check if it contains header files
                 has_headers = any(f.endswith(('.h', '.hpp', '.hxx', '.hh')) for f in files)
                 if has_headers or 'include' in dir_name:
-                    abs_dir = os.path.abspath(root)
-                    include_dirs.add(abs_dir)
-                    # Also add parent if it looks like a project root
-                    parent = os.path.dirname(abs_dir)
-                    if os.path.basename(parent) in ['src', 'source', 'lib']:
-                        include_dirs.add(parent)
+                    abs_dir = os.path.normpath(os.path.abspath(root))
+                    if abs_dir not in existing_include_paths:
+                        include_dirs.add(abs_dir)
         
-        # Add discovered include directories
+        # Add discovered include directories (avoiding duplicates)
         for inc_dir in sorted(include_dirs):
-            args.append(f'-I{inc_dir}')
+            if inc_dir not in existing_include_paths:
+                args.append(f'-I{inc_dir}')
         
         # 4. Try to read include paths from CMakeLists.txt (simple regex)
         if os.path.exists(cmake_file):
@@ -366,14 +507,15 @@ class ClangIntegration:
                             if os.path.isabs(d):
                                 abs_path = d
                             else:
-                                abs_path = os.path.abspath(os.path.join(project_root, d))
-                            if os.path.isdir(abs_path):
+                                abs_path = os.path.abspath(os.path.join(actual_project_root, d))
+                            abs_path = os.path.normpath(abs_path)
+                            if os.path.isdir(abs_path) and abs_path not in existing_include_paths:
                                 args.append(f'-I{abs_path}')
             except Exception:
                 pass
         
         # 5. Add parent directories as potential include paths (up to 2 levels)
-        current = project_root
+        current = actual_project_root
         for _ in range(2):
             parent = os.path.dirname(current)
             if parent == current:
@@ -621,7 +763,7 @@ class ClangIntegration:
             if not compile_args_map:
                 print(f"  [INFO] compile_commands.json not found, discovering compile arguments heuristically...")
                 print(f"  [INFO] This may result in incomplete parsing if includes are missing.")
-                fallback_args = ClangIntegration.discover_compile_arguments(project_root)
+                fallback_args = ClangIntegration.discover_compile_arguments(project_root, source_dir)
                 print(f"  [INFO] Discovered {len(fallback_args)} compile arguments")
                 # Show preview
                 preview = ' '.join(fallback_args[:8])
@@ -937,7 +1079,8 @@ class ClangIntegration:
                         break
                     project_root = parent
                 
-                parse_args = ClangIntegration.discover_compile_arguments(project_root)
+                # Use source_file's directory as scan_dir for hierarchical paths
+                parse_args = ClangIntegration.discover_compile_arguments(project_root, os.path.dirname(source_file_abs))
                 print(f"  [INFO] Using heuristically discovered compile arguments for {os.path.basename(source_file)}")
         else:
             # Remove output flags and ensure proper parsing
@@ -2182,7 +2325,9 @@ def build_from_source(source_dir: str, reuse_json: bool = False, dry_run: bool =
         print(f"  [INFO] For best results, generate compile_commands.json:")
         print(f"         - CMake: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .")
         print(f"         - Make: bear -- make")
-        fallback_args = ClangIntegration.discover_compile_arguments(source_dir)
+        # Detect project root and use source_dir as scan_dir
+        detected_root = ClangIntegration.detect_project_root(source_dir)
+        fallback_args = ClangIntegration.discover_compile_arguments(detected_root, source_dir)
         print(f"  [OK] Discovered {len(fallback_args)} compile arguments")
         # Show preview
         preview = ' '.join(fallback_args[:8])
