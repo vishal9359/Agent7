@@ -94,12 +94,40 @@ python agent.py --help
 
 ## 📖 Usage
 
+The agent supports two modes:
+
+### Mode 1: Build from C++ Source Directory (Recommended)
+
+```bash
+# With explicit project root and scan path (recommended)
+python agent.py --project-root <project_root_path> --scan-path <scan_path>
+
+# With auto-detected project root (backward compatible)
+python agent.py <source_directory>
+
+# With options
+python agent.py --project-root <project_root_path> --scan-path <scan_path> --reuse-json --dry-run
+```
+
+### Mode 2: Load from JSON Files (Backward Compatible)
+
 ```bash
 python agent.py <cfg_json_file> <description_json_file> [callgraph_json_file]
 ```
 
-### Example
+### Examples
 
+**Build from source with explicit paths:**
+```bash
+python agent.py --project-root D:\git-project\poseidonos --scan-path src/io/frontend_io
+```
+
+**Build from source (auto-detect project root):**
+```bash
+python agent.py /path/to/cpp/source
+```
+
+**Load from JSON files:**
 ```bash
 python agent.py example_cfg.json example_description.json example_callgraph.json
 ```
@@ -107,7 +135,7 @@ python agent.py example_cfg.json example_description.json example_callgraph.json
 On Unix-like systems, you can make it executable:
 ```bash
 chmod +x agent.py
-./agent.py example_cfg.json example_description.json example_callgraph.json
+./agent.py --project-root /path/to/project --scan-path src/io/frontend_io
 ```
 
 ### Example Files
