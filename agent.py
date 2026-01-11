@@ -340,57 +340,82 @@ class ClangIntegration:
         return include_paths
     
     @staticmethod
-    def find_header_file(header_name: str, project_root: str, existing_include_paths: List[str]) -> Optional[str]:
+    def find_header_file(header_name: str, project_root: str, existing_include_paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
         """
-        Search for a header file in the project.
+        Search for a header file in the project and return its path and parent directory.
         
         Args:
             header_name: Header name (e.g., "src/io/frontend_io/block_map_update_request.h")
             project_root: Project root directory
-            existing_include_paths: List of existing include paths
+            existing_include_paths: List of existing include paths (can have -I prefix)
         
         Returns:
-            Absolute path to the header file if found, None otherwise
+            Tuple of (absolute_path_to_header, parent_directory_for_include_path) if found, (None, None) otherwise
         """
         project_root = os.path.normpath(os.path.abspath(project_root))
+        
+        # Normalize existing include paths (remove -I prefix)
+        clean_include_paths = []
+        for inc_path in existing_include_paths:
+            inc_path_clean = inc_path.lstrip('-I').strip()
+            inc_path_clean = os.path.normpath(os.path.abspath(inc_path_clean))
+            clean_include_paths.append(inc_path_clean)
         
         # Try direct path relative to project root
         direct_path = os.path.join(project_root, header_name)
         if os.path.isfile(direct_path):
-            return direct_path
+            return (direct_path, os.path.dirname(direct_path))
         
         # Try with each include path as base
-        for inc_path in existing_include_paths:
-            # Remove -I prefix if present
-            inc_path_clean = inc_path.lstrip('-I')
-            inc_path_clean = os.path.normpath(os.path.abspath(inc_path_clean))
-            
+        for inc_path_clean in clean_include_paths:
             # Try header_name relative to include path
             potential_path = os.path.join(inc_path_clean, header_name)
             if os.path.isfile(potential_path):
-                return potential_path
+                return (potential_path, os.path.dirname(potential_path))
             
             # Try just the basename in the include path
             basename = os.path.basename(header_name)
             potential_path = os.path.join(inc_path_clean, basename)
             if os.path.isfile(potential_path):
-                return potential_path
+                return (potential_path, os.path.dirname(potential_path))
         
         # Try recursive search in project_root (limited depth)
         header_basename = os.path.basename(header_name)
         for root, dirs, files in os.walk(project_root):
             # Limit depth to avoid excessive searching
             depth = root[len(project_root):].count(os.sep)
-            if depth > 5:
+            if depth > 8:  # Increased depth for better discovery
                 dirs.clear()
                 continue
             
             if header_basename in files:
                 potential_path = os.path.join(root, header_basename)
                 if os.path.isfile(potential_path):
-                    return potential_path
+                    return (potential_path, os.path.dirname(potential_path))
         
-        return None
+        return (None, None)
+    
+    @staticmethod
+    def extract_missing_headers_from_diagnostics(diagnostics: List) -> List[str]:
+        """
+        Extract missing header file names from Clang diagnostics.
+        
+        Returns list of header file names that were reported as missing.
+        """
+        missing_headers = []
+        for diag in diagnostics:
+            msg = diag.spelling if hasattr(diag, 'spelling') else str(diag)
+            # Look for patterns like "file not found", "No such file or directory"
+            if 'file not found' in msg.lower() or 'no such file' in msg.lower():
+                # Try to extract the file name
+                # Pattern: 'file.h' file not found
+                import re
+                match = re.search(r'[\'"]?([^\'\"\s<>]+\.(h|hpp|hxx|hh))[\'"]?', msg)
+                if match:
+                    header_name = match.group(1)
+                    if header_name not in missing_headers:
+                        missing_headers.append(header_name)
+        return missing_headers
     
     @staticmethod
     def discover_compile_arguments(project_root: str, scan_dir: Optional[str] = None) -> List[str]:
@@ -2738,15 +2763,37 @@ Examples:
         """
     )
     
-    parser.add_argument('input', nargs='+', help='Source directory OR JSON files (cfg, description, [callgraph])')
+    parser.add_argument('input', nargs='*', help='Source directory OR JSON files (cfg, description, [callgraph])')
+    parser.add_argument('--project-root', type=str, help='Absolute path of the project root directory')
+    parser.add_argument('--scan-path', type=str, help='Relative or absolute path of the target scan directory')
     parser.add_argument('--reuse-json', action='store_true', help='Reuse existing JSON files if available')
     parser.add_argument('--dry-run', action='store_true', help='Do not save output files')
     
     args = parser.parse_args()
     
-    # Determine mode: if single argument and it's a directory, use build mode
-    if len(args.input) == 1 and os.path.isdir(args.input[0]):
-        # Build from source mode
+    # Determine mode: build from source if project-root and scan-path are provided, or if single directory argument
+    if args.project_root and args.scan_path:
+        # New mode: explicit project-root and scan-path
+        project_root = os.path.normpath(os.path.abspath(args.project_root))
+        scan_path = args.scan_path
+        
+        # Convert scan_path to absolute if it's relative
+        if not os.path.isabs(scan_path):
+            scan_path = os.path.normpath(os.path.join(project_root, scan_path))
+        else:
+            scan_path = os.path.normpath(os.path.abspath(scan_path))
+        
+        if not os.path.isdir(project_root):
+            print(f"Error: Project root directory does not exist: {project_root}")
+            sys.exit(1)
+        
+        if not os.path.isdir(scan_path):
+            print(f"Error: Scan path directory does not exist: {scan_path}")
+            sys.exit(1)
+        
+        build_from_source(scan_path, args.reuse_json, args.dry_run, project_root=project_root)
+    elif len(args.input) == 1 and os.path.isdir(args.input[0]):
+        # Build from source mode (backward compatible)
         build_from_source(args.input[0], args.reuse_json, args.dry_run)
     elif len(args.input) >= 2:
         # Load from JSON mode (backward compatible)
