@@ -992,18 +992,18 @@ class ClangIntegration:
                                             resolved_headers, updated_include_paths = ClangIntegration.resolve_missing_headers(
                                                 missing_headers, cpp_file_abs, project_root, parse_args
                                             )
-                                    if resolved_headers:
-                                        print(f"  [INFO] Resolved {len(resolved_headers)} missing header(s) for {os.path.basename(cpp_file)}, retrying parse...")
-                                        # Merge new include paths with existing parse_args
-                                        existing_flags = [arg for arg in parse_args if not arg.startswith('-I')]
-                                        new_include_paths = [arg for arg in updated_include_paths if arg.startswith('-I')]
-                                        parse_args = existing_flags + new_include_paths
-                                        if '-x' not in parse_args:
-                                            parse_args.extend(['-x', 'c++'])
-                                        if not any(arg.startswith('-std=') for arg in parse_args):
-                                            parse_args.append('-std=c++17')
-                                        continue  # Final retry
-                                    except:
+                                            if resolved_headers:
+                                                print(f"  [INFO] Resolved {len(resolved_headers)} missing header(s) for {os.path.basename(cpp_file)}, retrying parse...")
+                                                # Merge new include paths with existing parse_args
+                                                existing_flags = [arg for arg in parse_args if not arg.startswith('-I')]
+                                                new_include_paths = [arg for arg in updated_include_paths if arg.startswith('-I')]
+                                                parse_args = existing_flags + new_include_paths
+                                                if '-x' not in parse_args:
+                                                    parse_args.extend(['-x', 'c++'])
+                                                if not any(arg.startswith('-std=') for arg in parse_args):
+                                                    parse_args.append('-std=c++17')
+                                                continue  # Final retry
+                                    except Exception:
                                         pass
                                 continue
                         else:
