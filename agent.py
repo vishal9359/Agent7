@@ -1594,8 +1594,7 @@ class ClangIntegration:
                 node_id += 1
                 
                 # Process then branch (second child typically)
-                then_id = node_id
-                then_last_id = then_id
+                then_last_id = cond_id
                 if len(children_list) > 1:
                     then_cursor = children_list[1]
                     # Process statements in then block
@@ -1603,16 +1602,24 @@ class ClangIntegration:
                         # Compound statement - process each statement
                         then_stmts = list(then_cursor.get_children())
                         if then_stmts:
-                            for stmt in then_stmts:
+                            # Process first statement with edge from condition
+                            then_last_id = process_statement(then_stmts[0], cond_id)
+                            # Update the edge label to "true"
+                            for edge in cfg.edges:
+                                if edge.from_node == cond_id and edge.to_node == then_last_id:
+                                    edge.label = "true"
+                                    break
+                            # Process remaining statements
+                            for stmt in then_stmts[1:]:
                                 then_last_id = process_statement(stmt, then_last_id)
                         else:
                             # Empty then block
                             then_text = get_source_text(then_cursor, max_length=40)
-                            then_node = CFGNode(id=then_id, type="statement", label=then_text if then_text else "then block")
+                            then_node = CFGNode(id=node_id, type="statement", label=then_text if then_text else "then block")
                             cfg.nodes.append(then_node)
-                            cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
+                            cfg.edges.append(CFGEdge(from_node=cond_id, to_node=node_id, label="true"))
+                            then_last_id = node_id
                             node_id += 1
-                            then_last_id = then_id
                     else:
                         # Single statement in then
                         then_last_id = process_statement(then_cursor, cond_id)
@@ -1623,32 +1630,40 @@ class ClangIntegration:
                                 break
                 else:
                     # No then block - create placeholder
-                    then_node = CFGNode(id=then_id, type="statement", label="then block")
+                    then_node = CFGNode(id=node_id, type="statement", label="then block")
                     cfg.nodes.append(then_node)
-                    cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
+                    cfg.edges.append(CFGEdge(from_node=cond_id, to_node=node_id, label="true"))
+                    then_last_id = node_id
                     node_id += 1
-                    then_last_id = then_id
                 
                 # Process else branch if exists (third child)
                 has_else = len(children_list) >= 3
                 if has_else:
                     else_cursor = children_list[2]
-                    else_last_id = node_id
+                    else_last_id = cond_id
                     # Process statements in else block
                     if else_cursor.kind == CursorKind.COMPOUND_STMT:
                         # Compound statement - process each statement
                         else_stmts = list(else_cursor.get_children())
                         if else_stmts:
-                            for stmt in else_stmts:
+                            # Process first statement with edge from condition
+                            else_last_id = process_statement(else_stmts[0], cond_id)
+                            # Update the edge label to "false"
+                            for edge in cfg.edges:
+                                if edge.from_node == cond_id and edge.to_node == else_last_id:
+                                    edge.label = "false"
+                                    break
+                            # Process remaining statements
+                            for stmt in else_stmts[1:]:
                                 else_last_id = process_statement(stmt, else_last_id)
                         else:
                             # Empty else block
                             else_text = get_source_text(else_cursor, max_length=40)
-                            else_node = CFGNode(id=else_last_id, type="statement", label=else_text if else_text else "else block")
+                            else_node = CFGNode(id=node_id, type="statement", label=else_text if else_text else "else block")
                             cfg.nodes.append(else_node)
-                            cfg.edges.append(CFGEdge(from_node=cond_id, to_node=else_last_id, label="false"))
-                            node_id += 1
+                            cfg.edges.append(CFGEdge(from_node=cond_id, to_node=node_id, label="false"))
                             else_last_id = node_id
+                            node_id += 1
                     else:
                         # Single statement in else
                         else_last_id = process_statement(else_cursor, cond_id)
@@ -1658,8 +1673,8 @@ class ClangIntegration:
                                 edge.label = "false"
                                 break
                     
-                    # Connect then and else to a merge point (or return the last of both)
-                    # For simplicity, return the else last id
+                    # Both branches processed - need to merge or return the last processed node
+                    # For now, return the else last id (then and else will both flow to next statement)
                     return else_last_id
                 else:
                     return then_last_id  # Return then node as continuation
