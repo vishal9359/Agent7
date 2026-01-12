@@ -1489,6 +1489,71 @@ class ClangIntegration:
         cfg = CFG(function=function_name)
         node_id = 1
         
+        # Get the translation unit to access source code
+        tu = cursor.translation_unit
+        
+        def get_source_text(cursor: Cursor, max_length: int = 50) -> str:
+            """Extract source code text from cursor"""
+            try:
+                # Method 1: Use tokens (most reliable)
+                tokens = list(cursor.get_tokens())
+                if tokens:
+                    token_texts = [token.spelling for token in tokens]
+                    text = ' '.join(token_texts)
+                    # Clean up whitespace
+                    text = ' '.join(text.split())
+                    if len(text) > max_length:
+                        text = text[:max_length] + "..."
+                    return text
+            except:
+                pass
+            
+            # Method 2: Try to read from file using extent
+            try:
+                if cursor.location and cursor.location.file and cursor.extent:
+                    file_path = cursor.location.file.name
+                    if file_path and os.path.exists(file_path):
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            lines = f.readlines()
+                        
+                        start = cursor.extent.start
+                        end = cursor.extent.end
+                        if start and end and start.line > 0 and end.line > 0:
+                            # Extract lines (1-indexed in Clang)
+                            start_line_idx = start.line - 1
+                            end_line_idx = end.line - 1
+                            
+                            if start_line_idx < len(lines) and end_line_idx < len(lines):
+                                if start_line_idx == end_line_idx:
+                                    # Single line
+                                    line = lines[start_line_idx]
+                                    start_col = start.column - 1
+                                    end_col = end.column - 1
+                                    if start_col >= 0 and end_col <= len(line):
+                                        text = line[start_col:end_col].strip()
+                                    else:
+                                        text = line.strip()
+                                else:
+                                    # Multiple lines
+                                    text_parts = []
+                                    text_parts.append(lines[start_line_idx][start.column - 1:].strip())
+                                    for i in range(start_line_idx + 1, end_line_idx):
+                                        if i < len(lines):
+                                            text_parts.append(lines[i].strip())
+                                    if end_line_idx < len(lines):
+                                        text_parts.append(lines[end_line_idx][:end.column - 1].strip())
+                                    text = ' '.join(text_parts)
+                                
+                                # Clean up
+                                text = ' '.join(text.split())
+                                if len(text) > max_length:
+                                    text = text[:max_length] + "..."
+                                return text
+            except:
+                pass
+            
+            return ""
+        
         # Create entry node
         entry_node = CFGNode(id=node_id, type="entry")
         cfg.nodes.append(entry_node)
@@ -1530,39 +1595,115 @@ class ClangIntegration:
                 
                 # Process then branch (second child typically)
                 then_id = node_id
-                then_node = CFGNode(id=then_id, type="statement")
-                cfg.nodes.append(then_node)
-                cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
-                node_id += 1
+                then_last_id = then_id
+                if len(children_list) > 1:
+                    then_cursor = children_list[1]
+                    # Process statements in then block
+                    if then_cursor.kind == CursorKind.COMPOUND_STMT:
+                        # Compound statement - process each statement
+                        then_stmts = list(then_cursor.get_children())
+                        if then_stmts:
+                            for stmt in then_stmts:
+                                then_last_id = process_statement(stmt, then_last_id)
+                        else:
+                            # Empty then block
+                            then_text = get_source_text(then_cursor, max_length=40)
+                            then_node = CFGNode(id=then_id, type="statement", label=then_text if then_text else "then block")
+                            cfg.nodes.append(then_node)
+                            cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
+                            node_id += 1
+                            then_last_id = then_id
+                    else:
+                        # Single statement in then
+                        then_last_id = process_statement(then_cursor, cond_id)
+                        # Update edge label
+                        for edge in cfg.edges:
+                            if edge.from_node == cond_id and edge.to_node == then_last_id:
+                                edge.label = "true"
+                                break
+                else:
+                    # No then block - create placeholder
+                    then_node = CFGNode(id=then_id, type="statement", label="then block")
+                    cfg.nodes.append(then_node)
+                    cfg.edges.append(CFGEdge(from_node=cond_id, to_node=then_id, label="true"))
+                    node_id += 1
+                    then_last_id = then_id
                 
                 # Process else branch if exists (third child)
                 has_else = len(children_list) >= 3
                 if has_else:
-                    else_id = node_id
-                    else_node = CFGNode(id=else_id, type="statement")
-                    cfg.nodes.append(else_node)
-                    cfg.edges.append(CFGEdge(from_node=cond_id, to_node=else_id, label="false"))
-                    node_id += 1
-                    return else_id  # Return else node as continuation
+                    else_cursor = children_list[2]
+                    else_last_id = node_id
+                    # Process statements in else block
+                    if else_cursor.kind == CursorKind.COMPOUND_STMT:
+                        # Compound statement - process each statement
+                        else_stmts = list(else_cursor.get_children())
+                        if else_stmts:
+                            for stmt in else_stmts:
+                                else_last_id = process_statement(stmt, else_last_id)
+                        else:
+                            # Empty else block
+                            else_text = get_source_text(else_cursor, max_length=40)
+                            else_node = CFGNode(id=else_last_id, type="statement", label=else_text if else_text else "else block")
+                            cfg.nodes.append(else_node)
+                            cfg.edges.append(CFGEdge(from_node=cond_id, to_node=else_last_id, label="false"))
+                            node_id += 1
+                            else_last_id = node_id
+                    else:
+                        # Single statement in else
+                        else_last_id = process_statement(else_cursor, cond_id)
+                        # Update edge label
+                        for edge in cfg.edges:
+                            if edge.from_node == cond_id and edge.to_node == else_last_id:
+                                edge.label = "false"
+                                break
+                    
+                    # Connect then and else to a merge point (or return the last of both)
+                    # For simplicity, return the else last id
+                    return else_last_id
                 else:
-                    return then_id  # Return then node as continuation
+                    return then_last_id  # Return then node as continuation
                 
             elif stmt_cursor.kind == CursorKind.CALL_EXPR:
                 # Function call - get the callee name
-                callee = stmt_cursor.spelling or "unknown"
-                # If spelling is empty, try to get from referenced cursor
-                if callee == "unknown":
+                callee = stmt_cursor.spelling or ""
+                
+                # Try multiple methods to get function name
+                if not callee:
                     try:
+                        # Method 1: Try referenced cursor
                         referenced = stmt_cursor.referenced
                         if referenced:
-                            callee = referenced.spelling or "unknown"
+                            callee = referenced.spelling or ""
                     except:
                         pass
+                
+                if not callee:
+                    try:
+                        # Method 2: Try to extract from tokens
+                        tokens = list(stmt_cursor.get_tokens())
+                        if tokens:
+                            # First token is usually the function name
+                            callee = tokens[0].spelling if len(tokens) > 0 else ""
+                    except:
+                        pass
+                
+                if not callee:
+                    # Method 3: Extract from source text
+                    call_text = get_source_text(stmt_cursor, max_length=40)
+                    # Try to extract function name from call text (e.g., "func(args)" -> "func")
+                    import re
+                    match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', call_text)
+                    if match:
+                        callee = match.group(1)
+                    else:
+                        callee = call_text[:30] if call_text else "unknown"
                 
                 # Filter out operator calls and other system calls
                 if callee.startswith("operator") or callee.startswith("__"):
                     # Still create node but mark it differently
-                    stmt_node = CFGNode(id=node_id, type="statement")
+                    call_text = get_source_text(stmt_cursor, max_length=40)
+                    stmt_node = CFGNode(id=node_id, type="statement", label=call_text if call_text else "operator call")
                     cfg.nodes.append(stmt_node)
                     cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
                     node_id += 1
@@ -1575,14 +1716,18 @@ class ClangIntegration:
                 return node_id - 1
                 
             elif stmt_cursor.kind == CursorKind.RETURN_STMT:
-                return_node = CFGNode(id=node_id, type="return")
+                return_text = get_source_text(stmt_cursor, max_length=30)
+                return_node = CFGNode(id=node_id, type="return", label=return_text if return_text else "return")
                 cfg.nodes.append(return_node)
                 cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
                 node_id += 1
                 return node_id - 1
             
-            # Default: statement node
-            stmt_node = CFGNode(id=node_id, type="statement")
+            # Default: statement node - extract actual source code
+            stmt_text = get_source_text(stmt_cursor, max_length=50)
+            if not stmt_text:
+                stmt_text = f"statement ({stmt_cursor.kind.name})"
+            stmt_node = CFGNode(id=node_id, type="statement", label=stmt_text)
             cfg.nodes.append(stmt_node)
             cfg.edges.append(CFGEdge(from_node=prev_id, to_node=node_id))
             node_id += 1
@@ -1604,7 +1749,8 @@ class ClangIntegration:
                             prev_node_id = process_statement(stmt, prev_node_id)
                         except Exception as e:
                             # If processing fails, create a statement node and continue
-                            stmt_node = CFGNode(id=node_id, type="statement")
+                            stmt_text = get_source_text(stmt, max_length=50) if hasattr(stmt, 'extent') else "statement"
+                            stmt_node = CFGNode(id=node_id, type="statement", label=stmt_text if stmt_text else "statement")
                             cfg.nodes.append(stmt_node)
                             cfg.edges.append(CFGEdge(from_node=prev_node_id, to_node=node_id))
                             prev_node_id = node_id
@@ -2509,18 +2655,22 @@ class PrimaryAnalysisAgent:
         
         # Generate nodes from CFG (CFG is source of truth)
         for node in cfg.nodes:
-            # Use description for labels if available, otherwise use CFG info
+            # Use label if available (contains actual source code), otherwise use type-specific labels
             node_label = ""
-            if node.type == "entry":
+            if node.label:
+                # Label contains actual source code text
+                node_label = node.label
+            elif node.type == "entry":
                 node_label = f"Entry: {cfg.function}"
             elif node.type == "return":
-                node_label = "Return"
+                node_label = node.expr if node.expr else "Return"
             elif node.type == "condition":
-                node_label = node.expr
+                node_label = node.expr if node.expr else "condition"
             elif node.type == "call":
-                node_label = f"Call: {node.callee}"
+                node_label = f"Call: {node.callee}" if node.callee else "Call: unknown"
             else:
-                node_label = f"Node {node.id}"
+                # Fallback for statement nodes without label
+                node_label = node.expr if node.expr else f"Node {node.id}"
             
             lines.append(f"    {node.id}[\"{node_label}\"]")
         
