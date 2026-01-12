@@ -340,14 +340,15 @@ class ClangIntegration:
         return include_paths
     
     @staticmethod
-    def find_header_file(header_name: str, project_root: str, existing_include_paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    def find_header_file(header_name: str, project_root: str, existing_include_paths: List[str], source_file_dir: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """
         Search for a header file in the project and return its path and parent directory.
         
         Args:
-            header_name: Header name (e.g., "src/io/frontend_io/block_map_update_request.h")
+            header_name: Header name (e.g., "src/io/frontend_io/block_map_update_request.h" or "block_map_update_request.h")
             project_root: Project root directory
             existing_include_paths: List of existing include paths (can have -I prefix)
+            source_file_dir: Optional directory of the source file that includes this header (for local includes)
         
         Returns:
             Tuple of (absolute_path_to_header, parent_directory_for_include_path) if found, (None, None) otherwise
@@ -361,12 +362,29 @@ class ClangIntegration:
             inc_path_clean = os.path.normpath(os.path.abspath(inc_path_clean))
             clean_include_paths.append(inc_path_clean)
         
-        # Try direct path relative to project root
+        # Strategy 1: If source_file_dir is provided, check local includes first (quoted includes search local dir first)
+        if source_file_dir:
+            source_file_dir = os.path.normpath(os.path.abspath(source_file_dir))
+            # Try header_name relative to source file directory
+            local_path = os.path.join(source_file_dir, header_name)
+            if os.path.isfile(local_path):
+                return (local_path, source_file_dir)
+            
+            # Try just the basename in the source file directory (common case)
+            basename = os.path.basename(header_name)
+            local_basename_path = os.path.join(source_file_dir, basename)
+            if os.path.isfile(local_basename_path):
+                return (local_basename_path, source_file_dir)
+        
+        # Strategy 2: Try direct path relative to project root
+        # This handles includes like "src/io/frontend_io/block_map_update_request.h"
         direct_path = os.path.join(project_root, header_name)
         if os.path.isfile(direct_path):
-            return (direct_path, os.path.dirname(direct_path))
+            # Return the parent directory of the header as the include path
+            header_dir = os.path.dirname(direct_path)
+            return (direct_path, header_dir)
         
-        # Try with each include path as base
+        # Strategy 3: Try with each existing include path as base
         for inc_path_clean in clean_include_paths:
             # Try header_name relative to include path
             potential_path = os.path.join(inc_path_clean, header_name)
@@ -379,12 +397,32 @@ class ClangIntegration:
             if os.path.isfile(potential_path):
                 return (potential_path, os.path.dirname(potential_path))
         
-        # Try recursive search in project_root (limited depth)
+        # Strategy 4: Try recursive search in project_root (limited depth)
+        # First try with full header_name path
+        header_parts = header_name.replace('\\', '/').split('/')
+        if len(header_parts) > 1:
+            # Header has path components, try to find matching directory structure
+            for root, dirs, files in os.walk(project_root):
+                depth = root[len(project_root):].count(os.sep)
+                if depth > 10:  # Increased depth
+                    dirs.clear()
+                    continue
+                
+                # Check if this directory matches the header path structure
+                rel_path = os.path.relpath(root, project_root).replace('\\', '/')
+                if rel_path.endswith('/'.join(header_parts[:-1])) or '/'.join(header_parts[:-1]) in rel_path:
+                    header_basename = header_parts[-1]
+                    if header_basename in files:
+                        potential_path = os.path.join(root, header_basename)
+                        if os.path.isfile(potential_path):
+                            return (potential_path, root)
+        
+        # Strategy 5: Fallback to recursive search by basename only
         header_basename = os.path.basename(header_name)
         for root, dirs, files in os.walk(project_root):
             # Limit depth to avoid excessive searching
             depth = root[len(project_root):].count(os.sep)
-            if depth > 8:  # Increased depth for better discovery
+            if depth > 10:  # Increased depth for better discovery
                 dirs.clear()
                 continue
             
@@ -401,21 +439,86 @@ class ClangIntegration:
         Extract missing header file names from Clang diagnostics.
         
         Returns list of header file names that were reported as missing.
+        Handles both simple names (block_map_update_request.h) and paths (src/io/frontend_io/block_map_update_request.h).
         """
         missing_headers = []
+        import re
         for diag in diagnostics:
             msg = diag.spelling if hasattr(diag, 'spelling') else str(diag)
             # Look for patterns like "file not found", "No such file or directory"
             if 'file not found' in msg.lower() or 'no such file' in msg.lower():
-                # Try to extract the file name
-                # Pattern: 'file.h' file not found
-                import re
-                match = re.search(r'[\'"]?([^\'\"\s<>]+\.(h|hpp|hxx|hh))[\'"]?', msg)
-                if match:
-                    header_name = match.group(1)
+                # Try to extract the file name - handle both quoted and unquoted
+                # Pattern 1: 'file.h' file not found or "file.h" file not found
+                # Pattern 2: src/io/frontend_io/block_map_update_request.h file not found
+                # Pattern 3: 'src/io/frontend_io/block_map_update_request.h' file not found
+                
+                # First try to match quoted strings (most common)
+                quoted_match = re.search(r'[\'"]([^\'\"<>]+\.(h|hpp|hxx|hh))[\'"]', msg)
+                if quoted_match:
+                    header_name = quoted_match.group(1)
                     if header_name not in missing_headers:
                         missing_headers.append(header_name)
+                    continue
+                
+                # Then try to match unquoted header paths (e.g., src/io/frontend_io/block_map_update_request.h)
+                unquoted_match = re.search(r'([a-zA-Z0-9_/\\\-]+\.(h|hpp|hxx|hh))', msg)
+                if unquoted_match:
+                    header_name = unquoted_match.group(1)
+                    # Filter out false positives (e.g., "file.h" in "file.h file not found")
+                    if header_name not in missing_headers and not header_name.startswith('file.'):
+                        missing_headers.append(header_name)
+        
         return missing_headers
+    
+    @staticmethod
+    def resolve_missing_headers(missing_headers: List[str], source_file: str, project_root: str, current_include_paths: List[str]) -> Tuple[List[str], List[str]]:
+        """
+        Resolve missing headers by searching for them in the project and adding their directories to include paths.
+        
+        Args:
+            missing_headers: List of missing header file names/paths
+            source_file: Path to the source file that includes these headers
+            project_root: Project root directory
+            current_include_paths: Current list of include paths (with -I prefix)
+        
+        Returns:
+            Tuple of (resolved_headers, updated_include_paths)
+            resolved_headers: List of successfully resolved header paths
+            updated_include_paths: Updated include paths with newly discovered directories
+        """
+        source_file_dir = os.path.dirname(os.path.abspath(source_file))
+        project_root = os.path.normpath(os.path.abspath(project_root))
+        
+        resolved_headers = []
+        updated_include_paths = list(current_include_paths)
+        new_include_dirs = set()
+        
+        # Normalize existing include paths to avoid duplicates
+        existing_dirs = set()
+        for inc_path in current_include_paths:
+            inc_path_clean = inc_path.lstrip('-I').strip()
+            inc_path_clean = os.path.normpath(os.path.abspath(inc_path_clean))
+            existing_dirs.add(inc_path_clean)
+        
+        for header_name in missing_headers:
+            # Try to find the header
+            header_path, header_dir = ClangIntegration.find_header_file(
+                header_name, project_root, current_include_paths, source_file_dir
+            )
+            
+            if header_path and header_dir:
+                resolved_headers.append(header_path)
+                # Add the header's directory to include paths if not already present
+                header_dir_norm = os.path.normpath(os.path.abspath(header_dir))
+                if header_dir_norm not in existing_dirs:
+                    new_include_dirs.add(header_dir_norm)
+                    existing_dirs.add(header_dir_norm)
+        
+        # Add new include directories to the list
+        for new_dir in sorted(new_include_dirs):
+            updated_include_paths.append(f'-I{new_dir}')
+        
+        return resolved_headers, updated_include_paths
     
     @staticmethod
     def discover_compile_arguments(project_root: str, scan_dir: Optional[str] = None) -> List[str]:
@@ -835,22 +938,111 @@ class ClangIntegration:
                 except AttributeError:
                     pass
                 
-                # Parse with compile arguments from compile_commands.json
-                tu = index.parse(cpp_file, args=parse_args, options=parse_options)
+                # Parse with automatic header resolution retry
+                max_retries = 2
+                tu = None
+                for retry in range(max_retries):
+                    try:
+                        tu = index.parse(cpp_file, args=parse_args, options=parse_options)
+                        # Check for missing headers in diagnostics
+                        diags = list(tu.diagnostics)
+                        errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
+                        
+                        if errors and retry < max_retries - 1:
+                            # Extract missing headers
+                            missing_headers = ClangIntegration.extract_missing_headers_from_diagnostics(diags)
+                            if missing_headers:
+                                # Try to resolve missing headers
+                                resolved_headers, updated_include_paths = ClangIntegration.resolve_missing_headers(
+                                    missing_headers, cpp_file_abs, project_root, parse_args
+                                )
+                                
+                                if resolved_headers:
+                                    print(f"  [INFO] Resolved {len(resolved_headers)} missing header(s) for {os.path.basename(cpp_file)}, retrying parse...")
+                                    # Merge new include paths with existing parse_args
+                                    existing_flags = [arg for arg in parse_args if not arg.startswith('-I')]
+                                    new_include_paths = [arg for arg in updated_include_paths if arg.startswith('-I')]
+                                    parse_args = existing_flags + new_include_paths
+                                    # Also ensure we have basic flags
+                                    if '-x' not in parse_args:
+                                        parse_args.extend(['-x', 'c++'])
+                                    if not any(arg.startswith('-std=') for arg in parse_args):
+                                        parse_args.append('-std=c++17')
+                                    continue  # Retry parsing with updated include paths
+                        
+                        # If we get here, either no missing headers or last retry
+                        break
+                        
+                    except Exception as e:
+                        if retry < max_retries - 1:
+                            # Try with INCOMPLETE mode on first retry
+                            try:
+                                parse_options = TranslationUnit.PARSE_INCOMPLETE
+                                tu = index.parse(cpp_file, args=parse_args, options=parse_options)
+                                break
+                            except Exception as e2:
+                                # On last retry, check for missing headers and try to resolve
+                                if retry == max_retries - 2:
+                                    # Try to parse with minimal options to get diagnostics
+                                    try:
+                                        minimal_tu = index.parse(cpp_file, args=parse_args, options=TranslationUnit.PARSE_INCOMPLETE)
+                                        diags = list(minimal_tu.diagnostics)
+                                        missing_headers = ClangIntegration.extract_missing_headers_from_diagnostics(diags)
+                                        if missing_headers:
+                                            resolved_headers, updated_include_paths = ClangIntegration.resolve_missing_headers(
+                                                missing_headers, cpp_file_abs, project_root, parse_args
+                                            )
+                                    if resolved_headers:
+                                        print(f"  [INFO] Resolved {len(resolved_headers)} missing header(s) for {os.path.basename(cpp_file)}, retrying parse...")
+                                        # Merge new include paths with existing parse_args
+                                        existing_flags = [arg for arg in parse_args if not arg.startswith('-I')]
+                                        new_include_paths = [arg for arg in updated_include_paths if arg.startswith('-I')]
+                                        parse_args = existing_flags + new_include_paths
+                                        if '-x' not in parse_args:
+                                            parse_args.extend(['-x', 'c++'])
+                                        if not any(arg.startswith('-std=') for arg in parse_args):
+                                            parse_args.append('-std=c++17')
+                                        continue  # Final retry
+                                    except:
+                                        pass
+                                continue
+                        else:
+                            # Last retry failed, log and continue to next file
+                            print(f"  [WARNING] Failed to parse {os.path.basename(cpp_file)} after {max_retries} attempts: {e}")
+                            parse_errors.append((cpp_file, str(e)))
+                            break
+                
+                if tu is None:
+                    # Parsing failed completely, skip this file
+                    print(f"  [WARNING] Skipping {os.path.basename(cpp_file)} due to parsing failure")
+                    parse_errors.append((cpp_file, "Failed to parse after retries"))
+                    continue
                 
                 # Check for Clang diagnostics (errors/warnings)
                 diags = list(tu.diagnostics)
                 if diags:
                     errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
                     if errors:
-                        error_msgs = []
-                        for diag in errors[:5]:  # Limit to first 5 errors
-                            error_msgs.append(f"    {diag.spelling} (line {diag.location.line})")
-                        if len(errors) > 5:
-                            error_msgs.append(f"    ... and {len(errors) - 5} more errors")
-                        print(f"  [ERROR] Clang parsing errors in {os.path.basename(cpp_file)}:")
-                        for msg in error_msgs:
-                            print(msg)
+                        # Check if there are still unresolved missing headers
+                        missing_headers = ClangIntegration.extract_missing_headers_from_diagnostics(diags)
+                        if missing_headers:
+                            error_msgs = []
+                            for diag in errors[:5]:  # Limit to first 5 errors
+                                error_msgs.append(f"    {diag.spelling} (line {diag.location.line})")
+                            if len(errors) > 5:
+                                error_msgs.append(f"    ... and {len(errors) - 5} more errors")
+                            print(f"  [WARNING] Clang parsing errors in {os.path.basename(cpp_file)} ({len(missing_headers)} header(s) still missing):")
+                            for msg in error_msgs[:3]:  # Show only first 3
+                                print(msg)
+                        else:
+                            error_msgs = []
+                            for diag in errors[:5]:  # Limit to first 5 errors
+                                error_msgs.append(f"    {diag.spelling} (line {diag.location.line})")
+                            if len(errors) > 5:
+                                error_msgs.append(f"    ... and {len(errors) - 5} more errors")
+                            print(f"  [WARNING] Clang parsing errors in {os.path.basename(cpp_file)}:")
+                            for msg in error_msgs[:3]:  # Show only first 3
+                                print(msg)
                         # Continue but note that parsing may be incomplete
                 
                 # Walk AST to find function definitions
@@ -1127,27 +1319,117 @@ class ClangIntegration:
         except AttributeError:
             pass
         
-        try:
-            tu = index.parse(source_file, args=parse_args, options=parse_options)
-        except Exception as e:
-            # If parsing fails, try with INCOMPLETE mode (for missing includes)
-            print(f"  [WARNING] Initial parse failed for {os.path.basename(source_file)}, trying with INCOMPLETE mode...")
+        # Try to find project root for header resolution
+        project_root_for_headers = os.path.dirname(source_file_abs)
+        for _ in range(4):
+            if os.path.exists(os.path.join(project_root_for_headers, 'CMakeLists.txt')) or \
+               os.path.exists(os.path.join(project_root_for_headers, 'Makefile')) or \
+               os.path.exists(os.path.join(project_root_for_headers, '.git')):
+                break
+            parent = os.path.dirname(project_root_for_headers)
+            if parent == project_root_for_headers:
+                break
+            project_root_for_headers = parent
+        
+        # Parse with automatic header resolution retry
+        max_retries = 2
+        tu = None
+        for retry in range(max_retries):
             try:
-                parse_options = TranslationUnit.PARSE_INCOMPLETE
                 tu = index.parse(source_file, args=parse_args, options=parse_options)
-            except Exception as e2:
-                raise RuntimeError(
-                    f"[ERROR] Failed to parse translation unit for {source_file}: {e2}\n"
-                    f"  This indicates Clang cannot parse the file correctly\n"
-                    f"  Try generating compile_commands.json for more accurate parsing"
-                )
+                # Check for missing headers in diagnostics
+                diags = list(tu.diagnostics)
+                errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
+                
+                if errors and retry < max_retries - 1:
+                    # Extract missing headers
+                    missing_headers = ClangIntegration.extract_missing_headers_from_diagnostics(diags)
+                    if missing_headers:
+                        # Try to resolve missing headers
+                        resolved_headers, updated_include_paths = ClangIntegration.resolve_missing_headers(
+                            missing_headers, source_file_abs, project_root_for_headers, parse_args
+                        )
+                        
+                        if resolved_headers:
+                            print(f"  [INFO] Resolved {len(resolved_headers)} missing header(s), retrying parse...")
+                            # Merge new include paths with existing parse_args
+                            # Keep existing flags, add new include paths
+                            existing_flags = [arg for arg in parse_args if not arg.startswith('-I')]
+                            new_include_paths = [arg for arg in updated_include_paths if arg.startswith('-I')]
+                            # Merge: existing flags + new include paths
+                            parse_args = existing_flags + new_include_paths
+                            # Also ensure we have basic flags
+                            if '-x' not in parse_args:
+                                parse_args.extend(['-x', 'c++'])
+                            if not any(arg.startswith('-std=') for arg in parse_args):
+                                parse_args.append('-std=c++17')
+                            continue  # Retry parsing with updated include paths
+                
+                # If we get here, either no missing headers or last retry
+                break
+                
+            except Exception as e:
+                if retry < max_retries - 1:
+                    # Try with INCOMPLETE mode on first retry
+                    print(f"  [WARNING] Initial parse failed for {os.path.basename(source_file)}, trying with INCOMPLETE mode...")
+                    try:
+                        parse_options = TranslationUnit.PARSE_INCOMPLETE
+                        tu = index.parse(source_file, args=parse_args, options=parse_options)
+                        break
+                    except Exception as e2:
+                        # On last retry, check for missing headers and try to resolve
+                        if retry == max_retries - 2:
+                            # Try to parse with minimal options to get diagnostics
+                            try:
+                                minimal_tu = index.parse(source_file, args=parse_args, options=TranslationUnit.PARSE_INCOMPLETE)
+                                diags = list(minimal_tu.diagnostics)
+                                missing_headers = ClangIntegration.extract_missing_headers_from_diagnostics(diags)
+                                if missing_headers:
+                                    resolved_headers, updated_include_paths = ClangIntegration.resolve_missing_headers(
+                                        missing_headers, source_file_abs, project_root_for_headers, parse_args
+                                    )
+                                    if resolved_headers:
+                                        print(f"  [INFO] Resolved {len(resolved_headers)} missing header(s), retrying parse...")
+                                        # Merge new include paths with existing parse_args
+                                        existing_flags = [arg for arg in parse_args if not arg.startswith('-I')]
+                                        new_include_paths = [arg for arg in updated_include_paths if arg.startswith('-I')]
+                                        parse_args = existing_flags + new_include_paths
+                                        if '-x' not in parse_args:
+                                            parse_args.extend(['-x', 'c++'])
+                                        if not any(arg.startswith('-std=') for arg in parse_args):
+                                            parse_args.append('-std=c++17')
+                                        continue  # Final retry
+                            except:
+                                pass
+                        continue
+                else:
+                    raise RuntimeError(
+                        f"[ERROR] Failed to parse translation unit for {source_file}: {e}\n"
+                        f"  This indicates Clang cannot parse the file correctly\n"
+                        f"  Try generating compile_commands.json for more accurate parsing"
+                    )
+        
+        if tu is None:
+            raise RuntimeError(
+                f"[ERROR] Failed to parse translation unit for {source_file}\n"
+                f"  This indicates Clang cannot parse the file correctly\n"
+                f"  Try generating compile_commands.json for more accurate parsing"
+            )
         
         # Check diagnostics (but don't fail on errors if using fallback)
         diags = list(tu.diagnostics)
         errors = [d for d in diags if d.severity >= 2]  # Error or Fatal
         if errors:
             error_msgs = [f"    {d.spelling} (line {d.location.line})" for d in errors[:3]]
-            if not fallback_args and not args:
+            # Check if there are still unresolved missing headers
+            missing_headers = ClangIntegration.extract_missing_headers_from_diagnostics(diags)
+            if missing_headers:
+                print(f"  [WARNING] Clang parsing errors in {os.path.basename(source_file)}:")
+                for msg in error_msgs:
+                    print(msg)
+                print(f"  [INFO] {len(missing_headers)} header(s) still missing after resolution attempts")
+                print(f"  [INFO] Continuing with best-effort parsing...")
+            elif not fallback_args and not args:
                 # Using heuristic discovery - warn but continue
                 print(f"  [WARNING] Clang parsing errors in {os.path.basename(source_file)} (using heuristic discovery):")
                 for msg in error_msgs:
